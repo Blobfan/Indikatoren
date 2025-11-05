@@ -1,0 +1,683 @@
+//@version=5
+indicator("DTFX Structure Swings + Supertrend (Phase 1-5 + Zone Fix v4)", overlay=true, max_labels_count = 500, max_boxes_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const string GRP_SWING = "Swing Structure"
+initBars = input.int(34, "Bars für Initialisierung", minval=5, maxval=50, group=GRP_SWING)
+showBOSLabels = input.bool(true, "BOS-Pfeile anzeigen", group=GRP_SWING)
+timeoutBars = input.int(200, "Maximale Kerzen ohne neuen Swing (Timeout)", minval=5, maxval=500, group=GRP_SWING)
+showAllSwings = input.bool(true, "Alle Swings anzeigen (kleine Dreiecke)", group=GRP_SWING)
+
+const string GRP_ST = "Supertrend (Valid Swings)"
+stPeriods = input.int(12, "ATR Period", minval=1, group=GRP_ST)
+stMultiplier = input.float(5.0, "ATR Multiplier", step=0.1, minval=0.1, group=GRP_ST)
+stChangeATR = input.bool(true, "Change ATR Calculation Method?", group=GRP_ST)
+showSTLines = input.bool(true, "Supertrend Linien anzeigen", group=GRP_ST)
+highlighting = input.bool(true, "Supertrend Highlighter On/Off", group=GRP_ST)
+showCandidates = input.bool(true, "Kandidaten-Labels (S?/L?) anzeigen", group=GRP_ST)
+
+const string GRP_FIB = "Fibonacci Zonen"
+showFibZone = input.bool(true, "Fib-Zonen anzeigen", group=GRP_FIB)
+useHTFFibZones = input.bool(false, "Fib-Zonen vom HTF anzeigen", group=GRP_FIB)
+fibExtendRight = input.bool(true, "Fib-Zonen nach rechts erweitern", group=GRP_FIB)
+
+const string GRP_FIB1 = "Zone 1 (Primary Entry)"
+showZone1 = input.bool(true, "Zone 1 anzeigen", group=GRP_FIB1)
+fib1LowerPct = input.float(50.0, "Untere Grenze (%)", minval=-50.0, maxval=150.0, step=5.0, group=GRP_FIB1)
+fib1UpperPct = input.float(70.0, "Obere Grenze (%)", minval=-50.0, maxval=150.0, step=5.0, group=GRP_FIB1)
+fib1Transparency = input.int(80, "Transparenz (gefüllt)", minval=0, maxval=100, group=GRP_FIB1)
+
+const string GRP_FIB2 = "Zone 2 (Deep Retracement)"
+showZone2 = input.bool(true, "Zone 2 anzeigen", group=GRP_FIB2)
+fib2LowerPct = input.float(90.0, "Untere Grenze (%)", minval=-50.0, maxval=200.0, step=5.0, group=GRP_FIB2)
+fib2UpperPct = input.float(110.0, "Obere Grenze (%)", minval=-50.0, maxval=200.0, step=5.0, group=GRP_FIB2)
+fib2Transparency = input.int(80, "Transparenz (gefüllt)", minval=0, maxval=100, group=GRP_FIB2)
+
+const string GRP_HISTORY = "Zone History"
+showZoneHistory = input.bool(true, "Historische Zonen anzeigen", group=GRP_HISTORY)
+maxHistoryZones = input.int(50, "Max. Anzahl historischer Zonen", minval=0, maxval=100, group=GRP_HISTORY)
+historyTransparency = input.int(95, "Transparenz (historisch)", minval=0, maxval=100, group=GRP_HISTORY)
+
+const string GRP_HTF = "HTF Timeframe"
+useHTFBias = input.bool(true, "HTF Bias für Hintergrundfarbe verwenden (basiert auf letztem BOS)", group=GRP_HTF)
+htf1min = input.timeframe("5", "HTF für 1min Chart", options=["1", "5", "15", "60", "240", "1D"], group=GRP_HTF)
+htf5min = input.timeframe("15", "HTF für 5min Chart", options=["5", "15", "60", "240", "1D"], group=GRP_HTF)
+htf15min = input.timeframe("60", "HTF für 15min Chart", options=["15", "60", "240", "1D"], group=GRP_HTF)
+htf30min = input.timeframe("240", "HTF für 30min Chart", options=["30", "60", "240", "1D"], group=GRP_HTF)
+
+htfTimeframe = switch
+    timeframe.period == "1"  => htf1min
+    timeframe.period == "5"  => htf5min
+    timeframe.period == "15" => htf15min
+    timeframe.period == "30" => htf30min
+    timeframe.period == "60" => "240"
+    => "240"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZONE HISTORY ARRAYS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var array<box> historyZone1Boxes = array.new<box>()
+var array<box> historyZone2Boxes = array.new<box>()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPERTREND CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atr2 = ta.sma(ta.tr, stPeriods)
+atr = stChangeATR ? ta.atr(stPeriods) : atr2
+src = hl2
+
+up = src - (stMultiplier * atr)
+up1 = nz(up[1], up)
+up := close[1] > up1 ? math.max(up, up1) : up
+
+dn = src + (stMultiplier * atr)
+dn1 = nz(dn[1], dn)
+dn := close[1] < dn1 ? math.min(dn, dn1) : dn
+
+var int trend = 1
+trend := nz(trend[1], trend)
+trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+
+trendChanged = trend != trend[1]
+buySignal = trend == 1 and trend[1] == -1
+sellSignal = trend == -1 and trend[1] == 1
+
+upPlot = plot(showSTLines and trend == 1 ? up : na, title="Up Trend", style=plot.style_linebr, linewidth=2, color=color.green)
+dnPlot = plot(showSTLines and trend == -1 ? dn : na, title="Down Trend", style=plot.style_linebr, linewidth=2, color=color.red)
+mPlot = plot(ohlc4, title="", style=plot.style_circles, linewidth=0, display=display.none)
+
+longFillColor = highlighting ? (trend == 1 ? color.new(color.green, 90) : color.new(color.white, 100)) : color.new(color.white, 100)
+shortFillColor = highlighting ? (trend == -1 ? color.new(color.red, 90) : color.new(color.white, 100)) : color.new(color.white, 100)
+fill(mPlot, upPlot, title="UpTrend Highlighter", color=longFillColor)
+fill(mPlot, dnPlot, title="DownTrend Highlighter", color=shortFillColor)
+
+var float stTrackedHigh = high
+var int stTrackedHighBar = bar_index
+var float stTrackedLow = low
+var int stTrackedLowBar = bar_index
+
+if trend == 1
+    if high > stTrackedHigh or trendChanged
+        stTrackedHigh := high
+        stTrackedHighBar := bar_index
+else
+    if low < stTrackedLow or trendChanged
+        stTrackedLow := low
+        stTrackedLowBar := bar_index
+
+var float lastValidPrice = na
+var int lastValidBar = na
+var bool lastValidWasHigh = false
+
+if trendChanged and barstate.isconfirmed
+    if trend == -1
+        lastValidPrice := stTrackedHigh[1]
+        lastValidBar := stTrackedHighBar[1]
+        lastValidWasHigh := true
+        stTrackedLow := low
+        stTrackedLowBar := bar_index
+    else
+        lastValidPrice := stTrackedLow[1]
+        lastValidBar := stTrackedLowBar[1]
+        lastValidWasHigh := false
+        stTrackedHigh := high
+        stTrackedHighBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SWING STRUCTURE CODE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float allSH = na
+var float allSL = na
+var int   allSHBar = na
+var int   allSLBar = na
+var bool  allInitialized = false
+var bool  allIsUptrend = na
+var bool  allIsDowntrend = na
+var bool  allWaitForPullback = false
+var float allPullbackExtreme = na
+var int   allPullbackExtremeBar = na
+var float allPullbackConfirmLevel = na
+var string allExpectNext = na
+var float allCandidateLowPrice  = na
+var int   allCandidateLowBar    = na
+var float allCandidateHighPrice = na
+var int   allCandidateHighBar   = na
+var int allBarsSinceLastSwing = 0
+
+var bool allNewSHConfirmed = false
+var bool allNewSLConfirmed = false
+
+var float validSH = na
+var float validSL = na
+var int   validSHBar = na
+var int   validSLBar = na
+var int   validSHTime = na
+var int   validSLTime = na
+var float stCandidateSH = na
+var int   stCandidateSHBar = na
+var float stCandidateSL = na
+var int   stCandidateSLBar = na
+var label stCandidateSHLabel = na
+var label stCandidateSLLabel = na
+
+var string lastBOS = "NONE"
+
+var box fibZone1 = na
+var box fibZone2 = na
+var bool zone1IsBroken = false
+var bool zone2IsBroken = false
+
+var bool fibZone1IsHTF = false
+var bool fibZone2IsHTF = false
+
+var color activeZoneColor = na
+
+var bool needsZoneReset = false
+
+var float zoneOriginalStart = na
+var float zoneOriginalEnd = na
+var int zoneOriginalTime = na
+var int zoneEndTime = na  // ✅ NEU: Wann Zone endet
+var bool bosOccurredInCurrentArm = false
+var string currentArm = na
+
+bodyHigh(int idx) => math.max(close[idx], open[idx])
+bodyLow(int idx)  => math.min(close[idx], open[idx])
+isBodyBreaksHigh(float level, int idx) => not na(level) and bodyHigh(idx) > level
+isBodyBreaksLow(float level, int idx)  => not na(level) and bodyLow(idx) < level
+
+f_newLabel(int _bar, float _price, string _text, string _style, color _col) =>
+    label.new(_bar, _price, _text, style=_style, color=color.new(_col, 20), textcolor=color.new(color.white, 0), size=size.small)
+
+f_calcFibLevel(float start100pct, float end0pct, float pct) =>
+    start100pct + (end0pct - start100pct) * ((100.0 - pct) / 100.0)
+
+f_archiveZone(box zone1, box zone2, bool z1Broken, color zoneCol) =>
+    if showZoneHistory
+        if not na(zone1)
+            int leftEdge = box.get_left(zone1)
+            float topEdge = box.get_top(zone1)
+            float bottomEdge = box.get_bottom(zone1)
+            box archivedZ1 = box.new(leftEdge, topEdge, time, bottomEdge, xloc=xloc.bar_time, bgcolor=color.new(zoneCol, historyTransparency), border_color=color.new(zoneCol, historyTransparency), border_width=1)
+            array.push(historyZone1Boxes, archivedZ1)
+            while array.size(historyZone1Boxes) > maxHistoryZones
+                box oldBox = array.shift(historyZone1Boxes)
+                if not na(oldBox)
+                    box.delete(oldBox)
+        if not na(zone2) and z1Broken
+            int leftEdge2 = box.get_left(zone2)
+            float topEdge2 = box.get_top(zone2)
+            float bottomEdge2 = box.get_bottom(zone2)
+            box archivedZ2 = box.new(leftEdge2, topEdge2, time, bottomEdge2, xloc=xloc.bar_time, bgcolor=color.new(zoneCol, historyTransparency), border_color=color.new(zoneCol, historyTransparency), border_width=1)
+            array.push(historyZone2Boxes, archivedZ2)
+            while array.size(historyZone2Boxes) > maxHistoryZones
+                box oldBox2 = array.shift(historyZone2Boxes)
+                if not na(oldBox2)
+                    box.delete(oldBox2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INITIALISIERUNG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if not allInitialized and bar_index >= initBars and barstate.isconfirmed
+    allSH := ta.highest(high, initBars)
+    allSL := ta.lowest(low, initBars)
+    allSHBar := bar_index[ta.highestbars(high, initBars)]
+    allSLBar := bar_index[ta.lowestbars(low, initBars)]
+    allIsUptrend := high > high[1]
+    allIsDowntrend := not allIsUptrend
+    validSH := allSH
+    validSL := allSL
+    validSHBar := allSHBar
+    validSLBar := allSLBar
+    validSHTime := time[bar_index - allSHBar]
+    validSLTime := time[bar_index - allSLBar]
+    f_newLabel(validSHBar, validSH, "H", label.style_label_down, color.red)
+    f_newLabel(validSLBar, validSL, "L", label.style_label_up, color.green)
+    allInitialized := true
+    allWaitForPullback := false
+    allExpectNext := na
+    allBarsSinceLastSwing := 0
+    allCandidateLowPrice := na
+    allCandidateLowBar := na
+    allCandidateHighPrice := na
+    allCandidateHighBar := na
+    allNewSHConfirmed := false
+    allNewSLConfirmed := false
+    lastBOS := allIsUptrend ? "UP" : "DOWN"
+    
+    activeZoneColor := allIsUptrend ? color.green : color.red
+    
+    stCandidateSH := na
+    stCandidateSHBar := na
+    stCandidateSL := na
+    stCandidateSLBar := na
+    stCandidateSHLabel := na
+    stCandidateSLLabel := na
+    zone1IsBroken := false
+    zone2IsBroken := false
+    
+    fibZone1IsHTF := false
+    fibZone2IsHTF := false
+    needsZoneReset := false
+    
+    bosOccurredInCurrentArm := false
+    currentArm := na
+    zoneOriginalStart := na
+    zoneOriginalEnd := na
+    zoneOriginalTime := na
+    zoneEndTime := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HAUPTLOGIK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if allInitialized and barstate.isconfirmed
+    allBarsSinceLastSwing += 1
+    allNewSHConfirmed := false
+    allNewSLConfirmed := false
+    
+    if not allWaitForPullback and isBodyBreaksHigh(allSH, 0)
+        if not na(allCandidateLowBar)
+            allSL := allCandidateLowPrice
+            allSLBar := allCandidateLowBar
+            allNewSLConfirmed := true
+            allBarsSinceLastSwing := 0
+        allIsUptrend := true
+        allIsDowntrend := false
+        allWaitForPullback := true
+        allExpectNext := "SH"
+        allPullbackExtreme := high
+        allPullbackExtremeBar := bar_index
+        allPullbackConfirmLevel := low
+        allCandidateLowPrice := na
+        allCandidateLowBar := na
+        allCandidateHighPrice := na
+        allCandidateHighBar := na
+
+    if not allWaitForPullback and isBodyBreaksLow(allSL, 0)
+        if not na(allCandidateHighBar)
+            allSH := allCandidateHighPrice
+            allSHBar := allCandidateHighBar
+            allNewSHConfirmed := true
+            allBarsSinceLastSwing := 0
+        allIsUptrend := false
+        allIsDowntrend := true
+        allWaitForPullback := true
+        allExpectNext := "SL"
+        allPullbackExtreme := low
+        allPullbackExtremeBar := bar_index
+        allPullbackConfirmLevel := high
+        allCandidateLowPrice := na
+        allCandidateLowBar := na
+        allCandidateHighPrice := na
+        allCandidateHighBar := na
+
+    if allWaitForPullback
+        if allIsUptrend and allExpectNext == "SH"
+            if high > allPullbackExtreme
+                allPullbackExtreme := high
+                allPullbackExtremeBar := bar_index
+                allPullbackConfirmLevel := low
+            if bodyLow(0) < allPullbackConfirmLevel
+                allSH := allPullbackExtreme
+                allSHBar := allPullbackExtremeBar
+                allNewSHConfirmed := true
+                allWaitForPullback := false
+                allExpectNext := "SL"
+                allCandidateLowPrice := allPullbackExtreme
+                allCandidateLowBar := na
+                allBarsSinceLastSwing := 0
+        if allIsDowntrend and allExpectNext == "SL"
+            if low < allPullbackExtreme
+                allPullbackExtreme := low
+                allPullbackExtremeBar := bar_index
+                allPullbackConfirmLevel := high
+            if bodyHigh(0) > allPullbackConfirmLevel
+                allSL := allPullbackExtreme
+                allSLBar := allPullbackExtremeBar
+                allNewSLConfirmed := true
+                allWaitForPullback := false
+                allExpectNext := "SH"
+                allCandidateHighPrice := allPullbackExtreme
+                allCandidateHighBar := na
+                allBarsSinceLastSwing := 0
+
+    if not allWaitForPullback
+        if allIsUptrend and allExpectNext != "SH"
+            if na(allCandidateLowPrice) or low < allCandidateLowPrice
+                allCandidateLowPrice := low
+                allCandidateLowBar := bar_index
+            allCandidateHighPrice := na
+            allCandidateHighBar := na
+        if allIsDowntrend and allExpectNext != "SL"
+            if na(allCandidateHighPrice) or high > allCandidateHighPrice
+                allCandidateHighPrice := high
+                allCandidateHighBar := bar_index
+            allCandidateLowPrice := na
+            allCandidateLowBar := na
+
+    if not allWaitForPullback and allBarsSinceLastSwing >= timeoutBars
+        if allIsUptrend and allExpectNext != "SH" and not na(allCandidateLowBar)
+            allSL := allCandidateLowPrice
+            allSLBar := allCandidateLowBar
+            allNewSLConfirmed := true
+            allBarsSinceLastSwing := 0
+            allIsUptrend := true
+            allIsDowntrend := false
+            allWaitForPullback := true
+            allExpectNext := "SH"
+            allPullbackExtreme := high
+            allPullbackExtremeBar := bar_index
+            allPullbackConfirmLevel := low
+            allCandidateLowPrice := na
+            allCandidateLowBar := na
+            allCandidateHighPrice := na
+            allCandidateHighBar := na
+        if allIsDowntrend and allExpectNext != "SL" and not na(allCandidateHighBar)
+            allSH := allCandidateHighPrice
+            allSHBar := allCandidateHighBar
+            allNewSHConfirmed := true
+            allBarsSinceLastSwing := 0
+            allIsUptrend := false
+            allIsDowntrend := true
+            allWaitForPullback := true
+            allExpectNext := "SL"
+            allPullbackExtreme := low
+            allPullbackExtremeBar := bar_index
+            allPullbackConfirmLevel := high
+            allCandidateLowPrice := na
+            allCandidateLowBar := na
+            allCandidateHighPrice := na
+            allCandidateHighBar := na
+    
+    // ✅ BIDIREKTIONALE BOS DETECTION
+    if not bosOccurredInCurrentArm
+        if not na(validSH) and bodyHigh(0) > validSH
+            bosOccurredInCurrentArm := true
+            lastBOS := "UP"
+            if showBOSLabels
+                label.new(bar_index, low, "↑", style=label.style_none, color=color.new(color.green, 100), textcolor=color.new(color.green, 0), size=size.huge, yloc=yloc.belowbar)
+        
+        if not na(validSL) and bodyLow(0) < validSL
+            bosOccurredInCurrentArm := true
+            lastBOS := "DOWN"
+            if showBOSLabels
+                label.new(bar_index, high, "↓", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 0), size=size.huge, yloc=yloc.abovebar)
+    
+    if trend == 1
+        if na(stCandidateSH) or high > stCandidateSH
+            stCandidateSH := high
+            stCandidateSHBar := bar_index
+            if showCandidates
+                if not na(stCandidateSHLabel)
+                    label.delete(stCandidateSHLabel)
+                stCandidateSHLabel := label.new(stCandidateSHBar, stCandidateSH, "S?", style=label.style_label_down, color=color.new(color.orange, 50), textcolor=color.new(color.white, 30), size=size.tiny)
+    
+    if trend == -1
+        if na(stCandidateSL) or low < stCandidateSL
+            stCandidateSL := low
+            stCandidateSLBar := bar_index
+            if showCandidates
+                if not na(stCandidateSLLabel)
+                    label.delete(stCandidateSLLabel)
+                stCandidateSLLabel := label.new(stCandidateSLBar, stCandidateSL, "L?", style=label.style_label_up, color=color.new(color.orange, 50), textcolor=color.new(color.white, 30), size=size.tiny)
+    
+    // ✅ sellSignal → H validiert, Up-Arm endet
+    if sellSignal and not na(stCandidateSH)
+        if not na(stCandidateSHLabel)
+            label.delete(stCandidateSHLabel)
+            stCandidateSHLabel := na
+        
+        validSH := stCandidateSH
+        validSHBar := stCandidateSHBar
+        validSHTime := time
+        f_newLabel(validSHBar, validSH, "H", label.style_label_down, color.red)
+        stCandidateSH := na
+        stCandidateSHBar := na
+        
+        // ✅ Up-Arm endet: Wenn BOS war, erstelle Zone L→H (wird bei nächstem L enden)
+        if currentArm == "UP" and bosOccurredInCurrentArm
+            // Neue Zone: L→H (Fib-Berechnung)
+            zoneOriginalStart := validSL
+            zoneOriginalEnd := validSH
+            zoneOriginalTime := validSLTime
+            activeZoneColor := color.green
+            // Zone endet noch NICHT (wartet auf nächstes L)
+        
+        currentArm := "DOWN"
+        bosOccurredInCurrentArm := false
+    
+    // ✅ buySignal → L validiert, Down-Arm endet
+    if buySignal and not na(stCandidateSL)
+        if not na(stCandidateSLLabel)
+            label.delete(stCandidateSLLabel)
+            stCandidateSLLabel := na
+        
+        validSL := stCandidateSL
+        validSLBar := stCandidateSLBar
+        validSLTime := time
+        f_newLabel(validSLBar, validSL, "L", label.style_label_up, color.green)
+        stCandidateSL := na
+        stCandidateSLBar := na
+        
+        // ✅ Zone ENDET hier (3. ST-Wechsel): L1→H→L2
+        if not na(zoneOriginalStart) and activeZoneColor == color.green
+            // Archiviere alte Zone mit AKTUELLEM Zeit-Ende
+            if not useHTFFibZones and not na(fibZone1)
+                f_archiveZone(fibZone1, fibZone2, zone1IsBroken, activeZoneColor)
+                needsZoneReset := true
+                zone1IsBroken := false
+                zone2IsBroken := false
+            
+            // Setze End-Zeit auf JETZT (L2)
+            zoneEndTime := time
+        
+        // ✅ Down-Arm endet: Wenn BOS war, erstelle Zone H→L (wird bei nächstem H enden)
+        if currentArm == "DOWN" and bosOccurredInCurrentArm
+            // Neue Zone: H→L (Fib-Berechnung)
+            zoneOriginalStart := validSH
+            zoneOriginalEnd := validSL
+            zoneOriginalTime := validSHTime
+            activeZoneColor := color.red
+            // Zone endet noch NICHT (wartet auf nächstes H)
+        
+        currentArm := "UP"
+        bosOccurredInCurrentArm := false
+    
+    // ✅ Initialisiere erste Zone
+    if na(zoneOriginalStart) and not na(validSH) and not na(validSL)
+        if validSHTime > validSLTime
+            zoneOriginalStart := validSH
+            zoneOriginalEnd := validSL
+            zoneOriginalTime := validSHTime
+            activeZoneColor := color.red
+            currentArm := "DOWN"
+        else
+            zoneOriginalStart := validSL
+            zoneOriginalEnd := validSH
+            zoneOriginalTime := validSLTime
+            activeZoneColor := color.green
+            currentArm := "UP"
+        bosOccurredInCurrentArm := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTF DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[htfLastBOSForFib, htfValidSH, htfValidSL, htfValidSHTime, htfValidSLTime, htfStCandidateSH, htfStCandidateSL] = 
+  request.security(syminfo.tickerid, htfTimeframe, [lastBOS, validSH, validSL, validSHTime, validSLTime, stCandidateSH, stCandidateSL], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DUAL FIB ZONE DRAWING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if allInitialized and showFibZone
+    if needsZoneReset
+        if not na(fibZone1)
+            box.delete(fibZone1)
+            fibZone1 := na
+            fibZone1IsHTF := false
+        if not na(fibZone2)
+            box.delete(fibZone2)
+            fibZone2 := na
+            fibZone2IsHTF := false
+        needsZoneReset := false
+    
+    float fibStart = na
+    float fibEnd = na
+    int fibStartTime = na
+    color zoneColor = na
+    bool isDynamic = false
+    
+    if not useHTFFibZones and not na(zoneOriginalStart) and not na(zoneOriginalEnd)
+        fibStart := zoneOriginalStart
+        fibEnd := zoneOriginalEnd
+        fibStartTime := zoneOriginalTime
+        zoneColor := activeZoneColor
+        isDynamic := false
+    else if useHTFFibZones
+        string bosDirection = htfLastBOSForFib
+        float sourceSH = htfValidSH
+        float sourceSL = htfValidSL
+        int sourceSHTime = htfValidSHTime
+        int sourceSLTime = htfValidSLTime
+        float sourceCandidateSH = htfStCandidateSH
+        float sourceCandidateSL = htfStCandidateSL
+        
+        if bosDirection == "UP"
+            fibStart := sourceSL
+            fibEnd := sourceSH
+            fibStartTime := sourceSLTime
+            zoneColor := color.green
+            if not na(sourceSH) and not na(sourceSL) and sourceSHTime > sourceSLTime
+                isDynamic := false
+            else if not na(sourceCandidateSH)
+                fibEnd := sourceCandidateSH
+                isDynamic := true
+        else if bosDirection == "DOWN"
+            fibStart := sourceSH
+            fibEnd := sourceSL
+            fibStartTime := sourceSHTime
+            zoneColor := color.red
+            if not na(sourceSL) and not na(sourceSH) and sourceSLTime > sourceSHTime
+                isDynamic := false
+            else if not na(sourceCandidateSL)
+                fibEnd := sourceCandidateSL
+                isDynamic := true
+    
+    bool currentZone1Broken = zone1IsBroken
+    bool currentZone2Broken = zone2IsBroken
+    
+    if not na(fibStart) and not na(fibEnd) and not na(fibStartTime)
+        // ✅ Zone endet bei zoneEndTime, sonst läuft sie weiter
+        int rightEdge = na(zoneEndTime) ? (fibExtendRight ? time + (time - time[1]) * 20 : time) : zoneEndTime
+        
+        if showZone1
+            float zone1Lower = f_calcFibLevel(fibStart, fibEnd, fib1LowerPct)
+            float zone1Upper = f_calcFibLevel(fibStart, fibEnd, fib1UpperPct)
+            float zone1Top = math.max(zone1Lower, zone1Upper)
+            float zone1Bottom = math.min(zone1Lower, zone1Upper)
+            
+            if not useHTFFibZones and not currentZone1Broken and not isDynamic
+                if activeZoneColor == color.green
+                    if close < zone1Bottom
+                        zone1IsBroken := true
+                        currentZone1Broken := true
+                else if activeZoneColor == color.red
+                    if close > zone1Top
+                        zone1IsBroken := true
+                        currentZone1Broken := true
+            
+            if not na(fibZone1)
+                box.delete(fibZone1)
+            
+            if currentZone1Broken
+                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(color.gray, 95), border_color=color.new(color.gray, 70), border_width=1)
+            else if isDynamic
+                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, 100), border_color=color.new(zoneColor, 0), border_width=2, border_style=line.style_dashed)
+            else
+                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib1Transparency), border_color=color.new(zoneColor, 50), border_width=1)
+            
+            fibZone1IsHTF := useHTFFibZones
+        
+        if showZone2 and not isDynamic and currentZone1Broken
+            float zone2Lower = f_calcFibLevel(fibStart, fibEnd, fib2LowerPct)
+            float zone2Upper = f_calcFibLevel(fibStart, fibEnd, fib2UpperPct)
+            float zone2Top = math.max(zone2Lower, zone2Upper)
+            float zone2Bottom = math.min(zone2Lower, zone2Upper)
+            
+            if not useHTFFibZones and not currentZone2Broken
+                if activeZoneColor == color.green
+                    if close < zone2Bottom
+                        zone2IsBroken := true
+                        currentZone2Broken := true
+                else if activeZoneColor == color.red
+                    if close > zone2Top
+                        zone2IsBroken := true
+                        currentZone2Broken := true
+            
+            if not na(fibZone2)
+                box.delete(fibZone2)
+            
+            if currentZone2Broken
+                fibZone2 := box.new(fibStartTime, zone2Top, rightEdge, zone2Bottom, xloc=xloc.bar_time, bgcolor=color.new(color.gray, 95), border_color=color.new(color.gray, 70), border_width=1)
+            else
+                fibZone2 := box.new(fibStartTime, zone2Top, rightEdge, zone2Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib2Transparency), border_color=color.new(zoneColor, 50), border_width=1)
+            
+            fibZone2IsHTF := useHTFFibZones
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HISTORY VISIBILITY TOGGLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if not showZoneHistory
+    for i = 0 to array.size(historyZone1Boxes) - 1
+        box b = array.get(historyZone1Boxes, i)
+        if not na(b)
+            box.set_bgcolor(b, color.new(color.white, 100))
+            box.set_border_color(b, color.new(color.white, 100))
+    for i = 0 to array.size(historyZone2Boxes) - 1
+        box b = array.get(historyZone2Boxes, i)
+        if not na(b)
+            box.set_bgcolor(b, color.new(color.white, 100))
+            box.set_border_color(b, color.new(color.white, 100))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if showAllSwings and allNewSHConfirmed
+    label.new(allSHBar, allSH, "▼", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 15), size=size.tiny, yloc=yloc.abovebar)
+
+if showAllSwings and allNewSLConfirmed
+    label.new(allSLBar, allSL, "▲", style=label.style_none, color=color.new(color.green, 100), textcolor=color.new(color.green, 15), size=size.tiny, yloc=yloc.belowbar)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTF BIAS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+htfLastBOS = useHTFBias ? request.security(syminfo.tickerid, htfTimeframe, lastBOS, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : lastBOS
+
+var color bgCol = na
+if allInitialized
+    bgCol := htfLastBOS == "UP" ? color.new(color.green, 85) : na
+    bgCol := htfLastBOS == "DOWN" ? color.new(color.red, 85) : bgCol
+
+bgcolor(bgCol)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(buySignal, title="Supertrend Buy", message="Supertrend Buy Signal!")
+alertcondition(sellSignal, title="Supertrend Sell", message="Supertrend Sell Signal!")
+alertcondition(trendChanged, title="Supertrend Direction Change", message="Supertrend has changed direction!")
+alertcondition(zone1IsBroken, title="Zone 1 Broken", message="Zone 1 wurde durchbrochen!")
+alertcondition(zone2IsBroken, title="Zone 2 Broken", message="Zone 2 wurde durchbrochen!")
