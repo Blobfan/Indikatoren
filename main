@@ -1,5 +1,5 @@
 //@version=5
-indicator("DTFX Structure Swings + Supertrend (Phase 1-5 + Zone Fix v4)", overlay=true, max_labels_count = 500, max_boxes_count = 500)
+indicator("DTFX Structure Swings + Supertrend (v6 - Zone ends at BOS)", overlay=true, max_labels_count = 500, max_boxes_count = 500)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INPUT SETTINGS
@@ -18,6 +18,7 @@ stChangeATR = input.bool(true, "Change ATR Calculation Method?", group=GRP_ST)
 showSTLines = input.bool(true, "Supertrend Linien anzeigen", group=GRP_ST)
 highlighting = input.bool(true, "Supertrend Highlighter On/Off", group=GRP_ST)
 showCandidates = input.bool(true, "Kandidaten-Labels (S?/L?) anzeigen", group=GRP_ST)
+showSTStateLabels = input.bool(true, "ST State Labels (U/D/P) anzeigen", group=GRP_ST)
 
 const string GRP_FIB = "Fibonacci Zonen"
 showFibZone = input.bool(true, "Fib-Zonen anzeigen", group=GRP_FIB)
@@ -34,19 +35,19 @@ const string GRP_FIB2 = "Zone 2 (Deep Retracement)"
 showZone2 = input.bool(true, "Zone 2 anzeigen", group=GRP_FIB2)
 fib2LowerPct = input.float(90.0, "Untere Grenze (%)", minval=-50.0, maxval=200.0, step=5.0, group=GRP_FIB2)
 fib2UpperPct = input.float(110.0, "Obere Grenze (%)", minval=-50.0, maxval=200.0, step=5.0, group=GRP_FIB2)
-fib2Transparency = input.int(80, "Transparenz (gefüllt)", minval=0, maxval=100, group=GRP_FIB2)
+fib2Transparency = input.int(80, "Transparenz (gefüllt)", minval=0, maxval=100, group=GRP_FIB2);
 
 const string GRP_HISTORY = "Zone History"
 showZoneHistory = input.bool(true, "Historische Zonen anzeigen", group=GRP_HISTORY)
 maxHistoryZones = input.int(50, "Max. Anzahl historischer Zonen", minval=0, maxval=100, group=GRP_HISTORY)
-historyTransparency = input.int(95, "Transparenz (historisch)", minval=0, maxval=100, group=GRP_HISTORY)
+historyTransparency = input.int(95, "Transparenz (historisch)", minval=0, maxval=100, group=GRP_HISTORY);
 
 const string GRP_HTF = "HTF Timeframe"
 useHTFBias = input.bool(true, "HTF Bias für Hintergrundfarbe verwenden (basiert auf letztem BOS)", group=GRP_HTF)
 htf1min = input.timeframe("5", "HTF für 1min Chart", options=["1", "5", "15", "60", "240", "1D"], group=GRP_HTF)
 htf5min = input.timeframe("15", "HTF für 5min Chart", options=["5", "15", "60", "240", "1D"], group=GRP_HTF)
 htf15min = input.timeframe("60", "HTF für 15min Chart", options=["15", "60", "240", "1D"], group=GRP_HTF)
-htf30min = input.timeframe("240", "HTF für 30min Chart", options=["30", "60", "240", "1D"], group=GRP_HTF)
+htf30min = input.timeframe("240", "HTF für 30min Chart", options=["30", "60", "240", "1D"], group=GRP_HTF);
 
 htfTimeframe = switch
     timeframe.period == "1"  => htf1min
@@ -62,6 +63,18 @@ htfTimeframe = switch
 
 var array<box> historyZone1Boxes = array.new<box>()
 var array<box> historyZone2Boxes = array.new<box>()
+
+var int lastZoneStartTime = na
+var float lastZoneFibStart = na
+var float lastZoneFibEnd = na
+var string lastZoneDirection = na
+var color lastZoneColor = na
+
+// ✅ ZONE ENDING VARIABLEN
+var bool currentZoneActive = false
+var string zoneArmState = "WAITING"
+var int zoneCreationBar = na
+var bool zonePullbackSeen = false
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SUPERTREND CALCULATION
@@ -123,7 +136,7 @@ if trendChanged and barstate.isconfirmed
         stTrackedLowBar := bar_index
     else
         lastValidPrice := stTrackedLow[1]
-        lastValidBar := stTrackedLowBar[1]
+        lastValidBar := lastTrackedLowBar[1]
         lastValidWasHigh := false
         stTrackedHigh := high
         stTrackedHighBar := bar_index
@@ -159,6 +172,12 @@ var int   validSHBar = na
 var int   validSLBar = na
 var int   validSHTime = na
 var int   validSLTime = na
+
+var float lastConfirmedSH = na
+var float lastConfirmedSL = na
+var int lastConfirmedSHTime = na
+var int lastConfirmedSLTime = na
+
 var float stCandidateSH = na
 var int   stCandidateSHBar = na
 var float stCandidateSL = na
@@ -168,24 +187,12 @@ var label stCandidateSLLabel = na
 
 var string lastBOS = "NONE"
 
-var box fibZone1 = na
-var box fibZone2 = na
-var bool zone1IsBroken = false
-var bool zone2IsBroken = false
-
-var bool fibZone1IsHTF = false
-var bool fibZone2IsHTF = false
-
-var color activeZoneColor = na
-
-var bool needsZoneReset = false
-
-var float zoneOriginalStart = na
-var float zoneOriginalEnd = na
-var int zoneOriginalTime = na
-var int zoneEndTime = na  // ✅ NEU: Wann Zone endet
 var bool bosOccurredInCurrentArm = false
-var string currentArm = na
+
+var string armState = "UNENTSCHLOSSEN"
+
+var float lastHDuringUncertain = na
+var float lastLDuringUncertain = na
 
 bodyHigh(int idx) => math.max(close[idx], open[idx])
 bodyLow(int idx)  => math.min(close[idx], open[idx])
@@ -197,29 +204,6 @@ f_newLabel(int _bar, float _price, string _text, string _style, color _col) =>
 
 f_calcFibLevel(float start100pct, float end0pct, float pct) =>
     start100pct + (end0pct - start100pct) * ((100.0 - pct) / 100.0)
-
-f_archiveZone(box zone1, box zone2, bool z1Broken, color zoneCol) =>
-    if showZoneHistory
-        if not na(zone1)
-            int leftEdge = box.get_left(zone1)
-            float topEdge = box.get_top(zone1)
-            float bottomEdge = box.get_bottom(zone1)
-            box archivedZ1 = box.new(leftEdge, topEdge, time, bottomEdge, xloc=xloc.bar_time, bgcolor=color.new(zoneCol, historyTransparency), border_color=color.new(zoneCol, historyTransparency), border_width=1)
-            array.push(historyZone1Boxes, archivedZ1)
-            while array.size(historyZone1Boxes) > maxHistoryZones
-                box oldBox = array.shift(historyZone1Boxes)
-                if not na(oldBox)
-                    box.delete(oldBox)
-        if not na(zone2) and z1Broken
-            int leftEdge2 = box.get_left(zone2)
-            float topEdge2 = box.get_top(zone2)
-            float bottomEdge2 = box.get_bottom(zone2)
-            box archivedZ2 = box.new(leftEdge2, topEdge2, time, bottomEdge2, xloc=xloc.bar_time, bgcolor=color.new(zoneCol, historyTransparency), border_color=color.new(zoneCol, historyTransparency), border_width=1)
-            array.push(historyZone2Boxes, archivedZ2)
-            while array.size(historyZone2Boxes) > maxHistoryZones
-                box oldBox2 = array.shift(historyZone2Boxes)
-                if not na(oldBox2)
-                    box.delete(oldBox2)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INITIALISIERUNG
@@ -238,6 +222,12 @@ if not allInitialized and bar_index >= initBars and barstate.isconfirmed
     validSLBar := allSLBar
     validSHTime := time[bar_index - allSHBar]
     validSLTime := time[bar_index - allSLBar]
+    
+    lastConfirmedSH := validSH
+    lastConfirmedSL := validSL
+    lastConfirmedSHTime := validSHTime
+    lastConfirmedSLTime := validSLTime
+    
     f_newLabel(validSHBar, validSH, "H", label.style_label_down, color.red)
     f_newLabel(validSLBar, validSL, "L", label.style_label_up, color.green)
     allInitialized := true
@@ -252,27 +242,17 @@ if not allInitialized and bar_index >= initBars and barstate.isconfirmed
     allNewSLConfirmed := false
     lastBOS := allIsUptrend ? "UP" : "DOWN"
     
-    activeZoneColor := allIsUptrend ? color.green : color.red
-    
     stCandidateSH := na
     stCandidateSHBar := na
     stCandidateSL := na
     stCandidateSLBar := na
     stCandidateSHLabel := na
     stCandidateSLLabel := na
-    zone1IsBroken := false
-    zone2IsBroken := false
-    
-    fibZone1IsHTF := false
-    fibZone2IsHTF := false
-    needsZoneReset := false
     
     bosOccurredInCurrentArm := false
-    currentArm := na
-    zoneOriginalStart := na
-    zoneOriginalEnd := na
-    zoneOriginalTime := na
-    zoneEndTime := na
+    armState := allIsUptrend ? "MOVE_UP" : "MOVE_DOWN"
+    lastHDuringUncertain := na
+    lastLDuringUncertain := na
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HAUPTLOGIK
@@ -397,20 +377,72 @@ if allInitialized and barstate.isconfirmed
             allCandidateHighPrice := na
             allCandidateHighBar := na
     
-    // ✅ BIDIREKTIONALE BOS DETECTION
-    if not bosOccurredInCurrentArm
-        if not na(validSH) and bodyHigh(0) > validSH
-            bosOccurredInCurrentArm := true
-            lastBOS := "UP"
-            if showBOSLabels
-                label.new(bar_index, low, "↑", style=label.style_none, color=color.new(color.green, 100), textcolor=color.new(color.green, 0), size=size.huge, yloc=yloc.belowbar)
-        
-        if not na(validSL) and bodyLow(0) < validSL
-            bosOccurredInCurrentArm := true
-            lastBOS := "DOWN"
-            if showBOSLabels
-                label.new(bar_index, high, "↓", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 0), size=size.huge, yloc=yloc.abovebar)
+    // ✅ BOS DETECTION - EINFACHE LOGIK: Prüfe immer, setze Flag wenn BOS passiert
+    bool bosHappened = false
     
+    if not na(validSH) and bodyHigh(0) > validSH and not bosOccurredInCurrentArm
+        bosOccurredInCurrentArm := true
+        bosHappened := true
+        lastBOS := "UP"
+        if showBOSLabels
+            label.new(bar_index, low, "↑", style=label.style_none, color=color.new(color.green, 100), textcolor=color.new(color.green, 0), size=size.huge, yloc=yloc.belowbar)
+    
+    if not na(validSL) and bodyLow(0) < validSL and not bosOccurredInCurrentArm
+        bosOccurredInCurrentArm := true
+        bosHappened := true
+        lastBOS := "DOWN"
+        if showBOSLabels
+            label.new(bar_index, high, "↓", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 0), size=size.huge, yloc=yloc.abovebar)
+    
+    // ✅ ZONE ENDING: Zone endet sofort beim BOS
+    if bosHappened and currentZoneActive
+        // Zone endet sofort beim BOS
+        currentZoneActive := false
+        zoneArmState := "ZONE_ENDED"
+    
+    if trendChanged and barstate.isconfirmed and showSTStateLabels
+        string stText = ""
+        color stColor = color.white
+        string stStyle = label.style_label_up
+        string stYloc = yloc.belowbar
+        
+        if lastBOS == "DOWN"
+            if trend == 1
+                stText := "P"
+                stColor := color.orange
+                stStyle := label.style_label_up
+                stYloc := yloc.belowbar
+            else
+                stText := "D"
+                stColor := color.red
+                stStyle := label.style_label_down
+                stYloc := yloc.abovebar
+        else if lastBOS == "UP"
+            if trend == 1
+                stText := "U"
+                stColor := color.green
+                stStyle := label.style_label_up
+                stYloc := yloc.belowbar
+            else
+                stText := "P"
+                stColor := color.orange
+                stStyle := label.style_label_down
+                stYloc := yloc.abovebar
+        else
+            if trend == 1
+                stText := "U"
+                stColor := color.green
+                stStyle := label.style_label_up
+                stYloc := yloc.belowbar
+            else
+                stText := "D"
+                stColor := color.red
+                stStyle := label.style_label_down
+                stYloc := yloc.abovebar
+        
+        float labelPrice = stYloc == yloc.belowbar ? low : high
+        label.new(bar_index, labelPrice, stText, style=stStyle, color=color.new(stColor, 0), textcolor=color.new(color.white, 0), size=size.small, yloc=stYloc)
+
     if trend == 1
         if na(stCandidateSH) or high > stCandidateSH
             stCandidateSH := high
@@ -429,7 +461,6 @@ if allInitialized and barstate.isconfirmed
                     label.delete(stCandidateSLLabel)
                 stCandidateSLLabel := label.new(stCandidateSLBar, stCandidateSL, "L?", style=label.style_label_up, color=color.new(color.orange, 50), textcolor=color.new(color.white, 30), size=size.tiny)
     
-    // ✅ sellSignal → H validiert, Up-Arm endet
     if sellSignal and not na(stCandidateSH)
         if not na(stCandidateSHLabel)
             label.delete(stCandidateSHLabel)
@@ -439,22 +470,36 @@ if allInitialized and barstate.isconfirmed
         validSHBar := stCandidateSHBar
         validSHTime := time
         f_newLabel(validSHBar, validSH, "H", label.style_label_down, color.red)
+        
+        lastConfirmedSH := validSH
+        lastConfirmedSHTime := validSHTime
+        
         stCandidateSH := na
         stCandidateSHBar := na
         
-        // ✅ Up-Arm endet: Wenn BOS war, erstelle Zone L→H (wird bei nächstem L enden)
-        if currentArm == "UP" and bosOccurredInCurrentArm
-            // Neue Zone: L→H (Fib-Berechnung)
-            zoneOriginalStart := validSL
-            zoneOriginalEnd := validSH
-            zoneOriginalTime := validSLTime
-            activeZoneColor := color.green
-            // Zone endet noch NICHT (wartet auf nächstes L)
-        
-        currentArm := "DOWN"
+        // ✅ RESET bosOccurredInCurrentArm bei neuem Swing
         bosOccurredInCurrentArm := false
-    
-    // ✅ buySignal → L validiert, Down-Arm endet
+        
+        if armState == "MOVE_UP"
+            if bosOccurredInCurrentArm
+                armState := "PULLBACK_DOWN"
+            else
+                armState := "UNENTSCHLOSSEN"
+                lastHDuringUncertain := validSH
+                lastLDuringUncertain := na
+            
+        else if armState == "PULLBACK_UP"
+            armState := "MOVE_DOWN"
+            
+        else if armState == "UNENTSCHLOSSEN"
+            if not na(lastHDuringUncertain) and validSH > lastHDuringUncertain
+                armState := "PULLBACK_DOWN"
+            else
+                lastHDuringUncertain := validSH
+            
+        else
+            armState := "PULLBACK_DOWN"
+        
     if buySignal and not na(stCandidateSL)
         if not na(stCandidateSLLabel)
             label.delete(stCandidateSLLabel)
@@ -464,190 +509,147 @@ if allInitialized and barstate.isconfirmed
         validSLBar := stCandidateSLBar
         validSLTime := time
         f_newLabel(validSLBar, validSL, "L", label.style_label_up, color.green)
+        
+        lastConfirmedSL := validSL
+        lastConfirmedSLTime := validSLTime
+        
         stCandidateSL := na
         stCandidateSLBar := na
         
-        // ✅ Zone ENDET hier (3. ST-Wechsel): L1→H→L2
-        if not na(zoneOriginalStart) and activeZoneColor == color.green
-            // Archiviere alte Zone mit AKTUELLEM Zeit-Ende
-            if not useHTFFibZones and not na(fibZone1)
-                f_archiveZone(fibZone1, fibZone2, zone1IsBroken, activeZoneColor)
-                needsZoneReset := true
-                zone1IsBroken := false
-                zone2IsBroken := false
+        // ✅ RESET bosOccurredInCurrentArm bei neuem Swing
+        bosOccurredInCurrentArm := false
+        
+        if armState == "MOVE_DOWN"
+            if bosOccurredInCurrentArm
+                armState := "PULLBACK_UP"
+            else
+                armState := "UNENTSCHLOSSEN"
+                lastLDuringUncertain := validSL
+                lastHDuringUncertain := na
             
-            // Setze End-Zeit auf JETZT (L2)
-            zoneEndTime := time
-        
-        // ✅ Down-Arm endet: Wenn BOS war, erstelle Zone H→L (wird bei nächstem H enden)
-        if currentArm == "DOWN" and bosOccurredInCurrentArm
-            // Neue Zone: H→L (Fib-Berechnung)
-            zoneOriginalStart := validSH
-            zoneOriginalEnd := validSL
-            zoneOriginalTime := validSHTime
-            activeZoneColor := color.red
-            // Zone endet noch NICHT (wartet auf nächstes H)
-        
-        currentArm := "UP"
-        bosOccurredInCurrentArm := false
-    
-    // ✅ Initialisiere erste Zone
-    if na(zoneOriginalStart) and not na(validSH) and not na(validSL)
-        if validSHTime > validSLTime
-            zoneOriginalStart := validSH
-            zoneOriginalEnd := validSL
-            zoneOriginalTime := validSHTime
-            activeZoneColor := color.red
-            currentArm := "DOWN"
+        else if armState == "PULLBACK_DOWN"
+            armState := "MOVE_UP"
+            
+        else if armState == "UNENTSCHLOSSEN"
+            if not na(lastLDuringUncertain) and validSL < lastLDuringUncertain
+                armState := "PULLBACK_UP"
+            else
+                lastLDuringUncertain := validSL
+            
         else
-            zoneOriginalStart := validSL
-            zoneOriginalEnd := validSH
-            zoneOriginalTime := validSLTime
-            activeZoneColor := color.green
-            currentArm := "UP"
-        bosOccurredInCurrentArm := false
+            armState := "PULLBACK_UP"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HTF DATA
 // ═══════════════════════════════════════════════════════════════════════════════
 
-[htfLastBOSForFib, htfValidSH, htfValidSL, htfValidSHTime, htfValidSLTime, htfStCandidateSH, htfStCandidateSL] = 
-  request.security(syminfo.tickerid, htfTimeframe, [lastBOS, validSH, validSL, validSHTime, validSLTime, stCandidateSH, stCandidateSL], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[htfLastBOSForFib, htfValidSH, htfValidSL, htfValidSHTime, htfValidSLTime] = request.security(syminfo.tickerid, htfTimeframe, [lastBOS, validSH, validSL, validSHTime, validSLTime], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DUAL FIB ZONE DRAWING
+// ZONE DRAWING
 // ═══════════════════════════════════════════════════════════════════════════════
+
+var box currentZone1 = na
+var box currentZone2 = na
 
 if allInitialized and showFibZone
-    if needsZoneReset
-        if not na(fibZone1)
-            box.delete(fibZone1)
-            fibZone1 := na
-            fibZone1IsHTF := false
-        if not na(fibZone2)
-            box.delete(fibZone2)
-            fibZone2 := na
-            fibZone2IsHTF := false
-        needsZoneReset := false
+    bool canDrawZone = not na(lastConfirmedSH) and not na(lastConfirmedSL) and not na(lastConfirmedSHTime) and not na(lastConfirmedSLTime)
     
-    float fibStart = na
-    float fibEnd = na
-    int fibStartTime = na
-    color zoneColor = na
-    bool isDynamic = false
-    
-    if not useHTFFibZones and not na(zoneOriginalStart) and not na(zoneOriginalEnd)
-        fibStart := zoneOriginalStart
-        fibEnd := zoneOriginalEnd
-        fibStartTime := zoneOriginalTime
-        zoneColor := activeZoneColor
-        isDynamic := false
-    else if useHTFFibZones
-        string bosDirection = htfLastBOSForFib
-        float sourceSH = htfValidSH
-        float sourceSL = htfValidSL
-        int sourceSHTime = htfValidSHTime
-        int sourceSLTime = htfValidSLTime
-        float sourceCandidateSH = htfStCandidateSH
-        float sourceCandidateSL = htfStCandidateSL
+    if canDrawZone
+        bool zoneChanged = false
+        float fibStart = na
+        float fibEnd = na
+        int fibStartTime = na
+        string zoneDirection = na
+        color zoneColor = na
         
-        if bosDirection == "UP"
-            fibStart := sourceSL
-            fibEnd := sourceSH
-            fibStartTime := sourceSLTime
+        if lastBOS == "UP" and lastConfirmedSLTime < lastConfirmedSHTime
+            fibStart := lastConfirmedSL
+            fibEnd := lastConfirmedSH
+            fibStartTime := lastConfirmedSLTime
             zoneColor := color.green
-            if not na(sourceSH) and not na(sourceSL) and sourceSHTime > sourceSLTime
-                isDynamic := false
-            else if not na(sourceCandidateSH)
-                fibEnd := sourceCandidateSH
-                isDynamic := true
-        else if bosDirection == "DOWN"
-            fibStart := sourceSH
-            fibEnd := sourceSL
-            fibStartTime := sourceSHTime
+            zoneDirection := "UP"
+            if na(lastZoneStartTime) or lastZoneStartTime != fibStartTime or lastZoneFibStart != fibStart or lastZoneFibEnd != fibEnd
+                zoneChanged := true
+        else if lastBOS == "DOWN" and lastConfirmedSHTime < lastConfirmedSLTime
+            fibStart := lastConfirmedSH
+            fibEnd := lastConfirmedSL
+            fibStartTime := lastConfirmedSHTime
             zoneColor := color.red
-            if not na(sourceSL) and not na(sourceSH) and sourceSLTime > sourceSHTime
-                isDynamic := false
-            else if not na(sourceCandidateSL)
-                fibEnd := sourceCandidateSL
-                isDynamic := true
-    
-    bool currentZone1Broken = zone1IsBroken
-    bool currentZone2Broken = zone2IsBroken
-    
-    if not na(fibStart) and not na(fibEnd) and not na(fibStartTime)
-        // ✅ Zone endet bei zoneEndTime, sonst läuft sie weiter
-        int rightEdge = na(zoneEndTime) ? (fibExtendRight ? time + (time - time[1]) * 20 : time) : zoneEndTime
+            zoneDirection := "DOWN"
+            if na(lastZoneStartTime) or lastZoneStartTime != fibStartTime or lastZoneFibStart != fibStart or lastZoneFibEnd != fibEnd
+                zoneChanged := true
         
-        if showZone1
-            float zone1Lower = f_calcFibLevel(fibStart, fibEnd, fib1LowerPct)
-            float zone1Upper = f_calcFibLevel(fibStart, fibEnd, fib1UpperPct)
-            float zone1Top = math.max(zone1Lower, zone1Upper)
-            float zone1Bottom = math.min(zone1Lower, zone1Upper)
+        if zoneChanged and not na(fibStart) and not na(fibEnd)
+            if showZoneHistory and not na(currentZone1) and not na(lastZoneColor)
+                array.push(historyZone1Boxes, currentZone1)
+                if array.size(historyZone1Boxes) > maxHistoryZones
+                    oldBox = array.shift(historyZone1Boxes)
+                    box.delete(oldBox)
+                box.set_bgcolor(currentZone1, color.new(lastZoneColor, historyTransparency))
+                box.set_border_color(currentZone1, color.new(lastZoneColor, historyTransparency))
+            if showZoneHistory and not na(currentZone2) and not na(lastZoneColor)
+                array.push(historyZone2Boxes, currentZone2)
+                if array.size(historyZone2Boxes) > maxHistoryZones
+                    oldBox = array.shift(historyZone2Boxes)
+                    box.delete(oldBox)
+                box.set_bgcolor(currentZone2, color.new(lastZoneColor, historyTransparency))
+                box.set_border_color(currentZone2, color.new(lastZoneColor, historyTransparency))
             
-            if not useHTFFibZones and not currentZone1Broken and not isDynamic
-                if activeZoneColor == color.green
-                    if close < zone1Bottom
-                        zone1IsBroken := true
-                        currentZone1Broken := true
-                else if activeZoneColor == color.red
-                    if close > zone1Top
-                        zone1IsBroken := true
-                        currentZone1Broken := true
+            currentZone1 := na
+            currentZone2 := na
             
-            if not na(fibZone1)
-                box.delete(fibZone1)
+            if showZone1
+                float zone1Lower = f_calcFibLevel(fibStart, fibEnd, fib1LowerPct)
+                float zone1Upper = f_calcFibLevel(fibStart, fibEnd, fib1UpperPct)
+                float zone1Top = math.max(zone1Lower, zone1Upper)
+                float zone1Bottom = math.min(zone1Lower, zone1Upper)
+                int rightEdge = fibExtendRight ? time + (time - time[1]) * 20 : time
+                currentZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib1Transparency), border_color=color.new(zoneColor, 50), border_width=1)
+            if showZone2
+                float zone2Lower = f_calcFibLevel(fibStart, fibEnd, fib2LowerPct)
+                float zone2Upper = f_calcFibLevel(fibStart, fibEnd, fib2UpperPct)
+                float zone2Top = math.max(zone2Lower, zone2Upper)
+                float zone2Bottom = math.min(zone2Lower, zone2Upper)
+                int rightEdge2 = fibExtendRight ? time + (time - time[1]) * 20 : time
+                currentZone2 := box.new(fibStartTime, zone2Top, rightEdge2, zone2Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib2Transparency), border_color=color.new(zoneColor, 50), border_width=1)
             
-            if currentZone1Broken
-                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(color.gray, 95), border_color=color.new(color.gray, 70), border_width=1)
-            else if isDynamic
-                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, 100), border_color=color.new(zoneColor, 0), border_width=2, border_style=line.style_dashed)
-            else
-                fibZone1 := box.new(fibStartTime, zone1Top, rightEdge, zone1Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib1Transparency), border_color=color.new(zoneColor, 50), border_width=1)
-            
-            fibZone1IsHTF := useHTFFibZones
-        
-        if showZone2 and not isDynamic and currentZone1Broken
-            float zone2Lower = f_calcFibLevel(fibStart, fibEnd, fib2LowerPct)
-            float zone2Upper = f_calcFibLevel(fibStart, fibEnd, fib2UpperPct)
-            float zone2Top = math.max(zone2Lower, zone2Upper)
-            float zone2Bottom = math.min(zone2Lower, zone2Upper)
-            
-            if not useHTFFibZones and not currentZone2Broken
-                if activeZoneColor == color.green
-                    if close < zone2Bottom
-                        zone2IsBroken := true
-                        currentZone2Broken := true
-                else if activeZoneColor == color.red
-                    if close > zone2Top
-                        zone2IsBroken := true
-                        currentZone2Broken := true
-            
-            if not na(fibZone2)
-                box.delete(fibZone2)
-            
-            if currentZone2Broken
-                fibZone2 := box.new(fibStartTime, zone2Top, rightEdge, zone2Bottom, xloc=xloc.bar_time, bgcolor=color.new(color.gray, 95), border_color=color.new(color.gray, 70), border_width=1)
-            else
-                fibZone2 := box.new(fibStartTime, zone2Top, rightEdge, zone2Bottom, xloc=xloc.bar_time, bgcolor=color.new(zoneColor, fib2Transparency), border_color=color.new(zoneColor, 50), border_width=1)
-            
-            fibZone2IsHTF := useHTFFibZones
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HISTORY VISIBILITY TOGGLE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-if not showZoneHistory
-    for i = 0 to array.size(historyZone1Boxes) - 1
-        box b = array.get(historyZone1Boxes, i)
-        if not na(b)
-            box.set_bgcolor(b, color.new(color.white, 100))
-            box.set_border_color(b, color.new(color.white, 100))
-    for i = 0 to array.size(historyZone2Boxes) - 1
-        box b = array.get(historyZone2Boxes, i)
-        if not na(b)
-            box.set_bgcolor(b, color.new(color.white, 100))
-            box.set_border_color(b, color.new(color.white, 100))
+            lastZoneStartTime := fibStartTime
+            lastZoneFibStart := fibStart
+            lastZoneFibEnd := fibEnd
+            lastZoneDirection := zoneDirection
+            lastZoneColor := zoneColor
+            currentZoneActive := true
+            zoneCreationBar := bar_index
+            zonePullbackSeen := false
+            zoneArmState := "FIRST_MOVE_DONE"
+        else
+            if not currentZoneActive and zoneArmState == "ZONE_ENDED"
+                if showZoneHistory and not na(currentZone1) and not na(lastZoneColor)
+                    box.set_right(currentZone1, time)
+                    array.push(historyZone1Boxes, currentZone1)
+                    if array.size(historyZone1Boxes) > maxHistoryZones
+                        oldBox = array.shift(historyZone1Boxes)
+                        box.delete(oldBox)
+                    box.set_bgcolor(currentZone1, color.new(lastZoneColor, historyTransparency))
+                    box.set_border_color(currentZone1, color.new(lastZoneColor, historyTransparency))
+                    currentZone1 := na
+                if showZoneHistory and not na(currentZone2) and not na(lastZoneColor)
+                    box.set_right(currentZone2, time)
+                    array.push(historyZone2Boxes, currentZone2)
+                    if array.size(historyZone2Boxes) > maxHistoryZones
+                        oldBox = array.shift(historyZone2Boxes)
+                        box.delete(oldBox)
+                    box.set_bgcolor(currentZone2, color.new(lastZoneColor, historyTransparency))
+                    box.set_border_color(currentZone2, color.new(lastZoneColor, historyTransparency))
+                    currentZone2 := na
+                zoneArmState := "WAITING"
+            else if currentZoneActive and fibExtendRight
+                int rightEdge = time + (time - time[1]) * 20
+                if not na(currentZone1)
+                    box.set_right(currentZone1, rightEdge)
+                if not na(currentZone2)
+                    box.set_right(currentZone2, rightEdge)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PLOTTING
@@ -679,5 +681,3 @@ bgcolor(bgCol)
 alertcondition(buySignal, title="Supertrend Buy", message="Supertrend Buy Signal!")
 alertcondition(sellSignal, title="Supertrend Sell", message="Supertrend Sell Signal!")
 alertcondition(trendChanged, title="Supertrend Direction Change", message="Supertrend has changed direction!")
-alertcondition(zone1IsBroken, title="Zone 1 Broken", message="Zone 1 wurde durchbrochen!")
-alertcondition(zone2IsBroken, title="Zone 2 Broken", message="Zone 2 wurde durchbrochen!")
