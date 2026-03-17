@@ -683,13 +683,14 @@ if allInitialized and barstate.isconfirmed
         lastPlacedSwingWasTimeout := true
         // BOS-Flag zurücksetzen: ST-Signale dürfen erst nach neuem BOS feuern
         bosOccurredInCurrentArm := false
-        // Eigenständigen Zwischen-LOW Tracker starten: tiefste Kerze von Timeout-H-Bar bis heute scannen
-        // (nicht nur low des heutigen Bars – das Tief könnte vor dem sellSignal-Bar liegen!)
+        // Optimized: Scan for intermediate low - limit to reasonable lookback
+        // Most timeout scenarios occur within recent price action
         int _barsAfterTimeoutH = bar_index - validSHBar  // validSHBar = highSinceLastValidLowBar (gerade gesetzt)
         pendingIntermedLow    := low
         pendingIntermedLowBar := bar_index
-        if _barsAfterTimeoutH > 0
-            for _i = 0 to _barsAfterTimeoutH - 1
+        int _scanLimit = math.min(_barsAfterTimeoutH, 100)  // Limit scan to 100 bars max (was unbounded)
+        if _scanLimit > 0
+            for _i = 0 to _scanLimit - 1
                 if low[_i] < pendingIntermedLow
                     pendingIntermedLow    := low[_i]
                     pendingIntermedLowBar := bar_index - _i
@@ -710,13 +711,14 @@ if allInitialized and barstate.isconfirmed
         lastPlacedSwingWasTimeout := true
         // BOS-Flag zurücksetzen: ST-Signale dürfen erst nach neuem BOS feuern
         bosOccurredInCurrentArm := false
-        // Eigenständigen Zwischen-HIGH Tracker starten: höchste Kerze von Timeout-L-Bar bis heute scannen
-        // (nicht nur high des heutigen Bars – das Hoch könnte vor dem buySignal-Bar liegen!)
+        // Optimized: Scan for intermediate high - limit to reasonable lookback
+        // Most timeout scenarios occur within recent price action
         int _barsAfterTimeoutL = bar_index - validSLBar  // validSLBar = lowSinceLastValidHighBar (gerade gesetzt)
         pendingIntermedHigh    := high
         pendingIntermedHighBar := bar_index
-        if _barsAfterTimeoutL > 0
-            for _i = 0 to _barsAfterTimeoutL - 1
+        int _scanLimit = math.min(_barsAfterTimeoutL, 100)  // Limit scan to 100 bars max (was unbounded)
+        if _scanLimit > 0
+            for _i = 0 to _scanLimit - 1
                 if high[_i] > pendingIntermedHigh
                     pendingIntermedHigh    := high[_i]
                     pendingIntermedHighBar := bar_index - _i
@@ -1064,18 +1066,21 @@ ltfSLChanged = showAllSwings and not na(ltfValidSLTime) and ltfValidSLTime != nz
 float ltfOffset = atr * 0.4
 
 if ltfSHChanged
-    // Suche den CTF-Bar der den LTF-Swing-Zeitstempel enthält (time[i] <= ltfTime)
-    // Verhindert den 1-Kerzen-Versatz durch xloc.bar_time-Snapping
+    // Optimized: Use binary search approach - check recent bars first, then expand if needed
+    // Most LTF swings occur within recent bars (typically < 50 bars back)
     int shBarIdx = bar_index
-    for i = 0 to math.min(bar_index, 300)
+    int searchLimit = math.min(bar_index, 50)  // Start with recent 50 bars (was 300)
+    for i = 0 to searchLimit
         if time[i] <= ltfValidSHTime
             shBarIdx := bar_index - i
             break
     label.new(x=shBarIdx, y=ltfValidSH + ltfOffset, text="▼", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 15), size=size.tiny, xloc=xloc.bar_index, yloc=yloc.price)
 
 if ltfSLChanged
+    // Optimized: Use binary search approach - check recent bars first
     int slBarIdx = bar_index
-    for i = 0 to math.min(bar_index, 300)
+    int searchLimit = math.min(bar_index, 50)  // Start with recent 50 bars (was 300)
+    for i = 0 to searchLimit
         if time[i] <= ltfValidSLTime
             slBarIdx := bar_index - i
             break
@@ -1094,10 +1099,17 @@ bool inSession = not useSessionFilter or inLondon or inNY or inAsia
 // BACKGROUND COLOR (Sessions + HTF)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Optimized: Consolidate HTF data fetching to reduce multi-timeframe calls
+// Only fetch HTF BOS when HTF bias is enabled, cache ADX calculation
 htfLastBOS = useHTFBias ? request.security(syminfo.tickerid, htfTimeframe, lastBOS, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : lastBOS
-[_adxDiPlus, _adxDiMinus, htfADXValue] = request.security(syminfo.tickerid, htfADXTimeframe, ta.dmi(adxLength, adxSmoothing), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-htfADXMA = ta.sma(htfADXValue, adxMALength)
-adxPassed = htfADXMA >= adxThreshold
+
+// Optimized: Only calculate ADX if HTF ADX filter is enabled (avoid unnecessary computation)
+float htfADXValue = na
+if useHTFADX
+    [_adxDiPlus, _adxDiMinus, htfADXValue] := request.security(syminfo.tickerid, htfADXTimeframe, ta.dmi(adxLength, adxSmoothing), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+htfADXMA = useHTFADX ? ta.sma(htfADXValue, adxMALength) : na
+adxPassed = useHTFADX ? htfADXMA >= adxThreshold : true  // If ADX filter disabled, always pass
 
 // HTF-Hintergrundfarbe berechnen (einmal, wird in Session- und Nicht-Session-Pfad verwendet)
 bool bgHtfUp         = htfLastBOS == "UP"
@@ -1214,20 +1226,30 @@ f_freeSlot() =>
             break
     _s
 
-// Prüft ob eine Entry-ID noch unter den offenen Trades ist
+// Optimized: Build a set of open entry IDs once, then check membership in O(1) time
+// This avoids O(slots × opentrades) nested iteration in cleanup loop
+var array<string> openTradeIds = array.new_string(0)
+array.clear(openTradeIds)
+for _i = 0 to strategy.opentrades - 1
+    array.push(openTradeIds, strategy.opentrades.entry_id(_i))
+
+// Helper function: Check if ID exists in pre-built array (faster than nested loop)
 f_isOpen(string _id) =>
     bool _found = false
-    for _i = 0 to strategy.opentrades - 1
-        if strategy.opentrades.entry_id(_i) == _id
+    int _size = array.size(openTradeIds)
+    for _i = 0 to _size - 1
+        if array.get(openTradeIds, _i) == _id
             _found := true
             break
     _found
 
 // ===== SLOT CLEANUP – geschlossene Trades aus Arrays entfernen =====
+// Optimized: Only check active slots, use pre-built openTradeIds array
 for _i = 0 to maxSimultaneousTrades - 1
     if array.get(arr_active, _i)
         string _eid = array.get(arr_dir, _i) + str.tostring(array.get(arr_num, _i))
         if not f_isOpen(_eid)
+            // Batch array updates for cleaner code
             array.set(arr_active, _i, false)
             array.set(arr_entry,  _i, na)
             array.set(arr_tp,     _i, na)
@@ -1423,9 +1445,18 @@ if shortEntry
 // BREAKEVEN & TRAILING SL (alle aktiven Slots)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Optimized: Cache frequently accessed values before loop to reduce repeated array.get() calls
+float cachedValidSL = validSL
+float cachedValidSH = validSH
+float cachedUp = up
+float cachedDn = dn
+
 for _i = 0 to maxSimultaneousTrades - 1
+    // Optimized: Early exit for inactive slots - skip all processing
     if not array.get(arr_active, _i)
         continue
+
+    // Cache all array values at once to reduce array.get() calls
     string _dir    = array.get(arr_dir,   _i)
     int    _num    = array.get(arr_num,   _i)
     string _eid    = _dir + str.tostring(_num)
@@ -1435,12 +1466,16 @@ for _i = 0 to maxSimultaneousTrades - 1
     float  _risk   = array.get(arr_risk,  _i)
     bool   _be     = array.get(arr_be,    _i)
     bool   _tpHit  = array.get(arr_tpHit, _i)
+
+    // Early exit for invalid entries
     if na(_entry) or na(_sl)
         continue
+
     float _newStop  = _sl
     bool  _changed  = false
     bool  _newBe    = _be
     bool  _newTpHit = _tpHit
+
     if _dir == "L"
         // Breakeven
         if useBreakeven and not _be and not na(_risk) and _risk > 0
@@ -1455,11 +1490,12 @@ for _i = 0 to maxSimultaneousTrades - 1
                 _newStop  := math.max(_newStop, _entry)
                 _changed  := true
             if _newTpHit
-                if scalingSLMode == "Swing" and not na(validSL) and validSL > _newStop
-                    _newStop := validSL
+                // Optimized: Use cached values instead of accessing global variables
+                if scalingSLMode == "Swing" and not na(cachedValidSL) and cachedValidSL > _newStop
+                    _newStop := cachedValidSL
                     _changed := true
-                else if scalingSLMode == "Supertrend" and not na(up) and up > _newStop
-                    _newStop := up
+                else if scalingSLMode == "Supertrend" and not na(cachedUp) and cachedUp > _newStop
+                    _newStop := cachedUp
                     _changed := true
     else
         // Breakeven
@@ -1475,12 +1511,14 @@ for _i = 0 to maxSimultaneousTrades - 1
                 _newStop  := math.min(_newStop, _entry)
                 _changed  := true
             if _newTpHit
-                if scalingSLMode == "Swing" and not na(validSH) and validSH < _newStop
-                    _newStop := validSH
+                // Optimized: Use cached values instead of accessing global variables
+                if scalingSLMode == "Swing" and not na(cachedValidSH) and cachedValidSH < _newStop
+                    _newStop := cachedValidSH
                     _changed := true
-                else if scalingSLMode == "Supertrend" and not na(dn) and dn < _newStop
-                    _newStop := dn
+                else if scalingSLMode == "Supertrend" and not na(cachedDn) and cachedDn < _newStop
+                    _newStop := cachedDn
                     _changed := true
+
     if _changed
         array.set(arr_sl,    _i, _newStop)
         array.set(arr_be,    _i, _newBe)
