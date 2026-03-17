@@ -1,3 +1,1510 @@
-fib2Transparency = input.int(80, "Transparenz (gefüllt)", minval=0, maxval=100, group=GRP_FIB2)
-historyTransparency = input.int(95, "Transparenz (historisch)", minval=0, maxval=100, group=GRP_HISTORY)
-htf30min = input.timeframe("240", "HTF für 30min Chart", options=["30", "60", "240", "1D"], group=GRP_HTF)
+//@version=5
+strategy("DTFX Structure Swings + Supertrend Strategie", overlay=true, max_labels_count = 500, max_boxes_count = 500, pyramiding=5, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=50)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const string GRP_SWING = "Swing Structure"
+initBars    = input.int(34, "Bars für Initialisierung", minval=5, maxval=50, group=GRP_SWING)
+timeoutBars = input.int(34, "Maximale Kerzen ohne neuen Swing (Timeout)", minval=5, maxval=500, group=GRP_SWING)
+
+const string GRP_ST = "Supertrend (Valid Swings)"
+stPeriods    = input.int(12, "ATR Period", minval=1, group=GRP_ST)
+stMultiplier = input.float(3.0, "ATR Multiplier (alle TF)", step=0.1, minval=0.1, group=GRP_ST, tooltip="Ein Wert für alle Timeframes. Höher = weniger, aber größere Swings")
+stChangeATR  = input.bool(true, "Change ATR Calculation Method?", group=GRP_ST)
+useValidSwingTimeout  = input.bool(true, "Valid Swing Timeout aktivieren", group=GRP_ST)
+validSwingTimeoutBars = input.int(300, "Valid Swing Timeout (Kerzen)", minval=10, maxval=2000, group=GRP_ST, tooltip="Nach X Kerzen ohne neuen Valid Swing wird bei nächstem ST-Wechsel ein Timeout-Swing gesetzt")
+swingTrackingMode = input.string("High/Low", "Swing-Extrempunkte tracken via", options=["High/Low", "Close", "Body"], group=GRP_ST, tooltip="High/Low = Wicks werden berücksichtigt (Standard)\nClose = Nur Schlusskurs (filtert Spike-Wicks)\nBody = Kerzenkörper max(Open,Close) / min(Open,Close)")
+useMinSwingGate = input.bool(true, "Mindest-Swing-Gate aktivieren", group=GRP_ST, tooltip="Swing wird nur gesetzt wenn das Bein mind. N × ATR groß ist – filtert Mini-Swings in Chop")
+minSwingATRMult = input.float(1.5, "Mindest-Swing Größe (× ATR)", step=0.1, minval=0.1, group=GRP_ST)
+useBOSGate      = input.bool(true, "BOS-Gate: Swings nur nach BOS setzen", group=GRP_ST, tooltip="Ein: Validierte Swings werden nur gesetzt wenn vorher ein BOS stattgefunden hat (präzisere Struktur, Standard)\nAus: Swing bei jedem ST-Wechsel gesetzt – gleich wie die alte Strategie (mehr Swings, auch in Konsolidierung)")
+oneTradePerSwing = input.bool(false, "One Trade Per Swing (wenn BOSGate aktiv)", group=GRP_ST, tooltip="Wenn aktiv: Pro Swing nur 1 Trade erlaubt. Nach Entry warten bis nächster BOS (Up oder Down) bevor nächster Trade genommen wird.")
+
+const string GRP_SESSION = "Session Filter"
+useSessionFilter = input.bool(true, "Session Filter aktivieren", group=GRP_SESSION, tooltip="Trades werden nur in den aktiven Sessions genommen")
+londonSession = input.session("0700-1600", "London Session Zeit (UTC)", group=GRP_SESSION)
+nySession     = input.session("1300-2200", "New York Session Zeit (UTC)", group=GRP_SESSION)
+asiaSession   = input.session("2100-0600", "Asia Session Zeit (UTC)", group=GRP_SESSION, tooltip="21:00 UTC bis 06:00 UTC (Tokyo/Sydney)")
+enableLondon = input.bool(true, "London Session aktivieren", group=GRP_SESSION)
+enableNY     = input.bool(true, "New York Session aktivieren", group=GRP_SESSION)
+enableAsia   = input.bool(false, "Asia Session aktivieren", group=GRP_SESSION)
+
+const string GRP_EMA = "EMA Filter"
+emaFastLength = input.int(21, "Schnelle EMA Länge", minval=1, group=GRP_EMA)
+emaSlowLength = input.int(120, "Langsame EMA Länge", minval=1, group=GRP_EMA)
+emaFilterMode = input.string("EMA-Cross", "EMA Filter Modus", options=["Deaktiviert", "Preis-Touch", "EMA-Cross", "Fast im Pullback"], group=GRP_EMA, tooltip="Deaktiviert: kein EMA Filter\nPreis-Touch: Preis muss im Pullback-Arm den Slow EMA berühren (Short: High über Slow EMA | Long: Low unter Slow EMA)\nEMA-Cross: Fast EMA muss für Short unter Slow EMA liegen, für Long darüber\nFast im Pullback: Fast EMA muss im Pullback-Arm über Slow EMA gewesen sein (Short) bzw. darunter (Long)")
+
+const string GRP_TRADE = "Trade Management"
+enableTrade1 = input.bool(true, "Trade aktivieren", group=GRP_TRADE)
+trade1Percent = input.int(100, "Positionsgröße (%)", minval=0, maxval=100, group=GRP_TRADE)
+useFixedRRR = input.bool(false, "Festes RRR verwenden", group=GRP_TRADE, tooltip="Wenn aktiv: TP wird mit festem RRR berechnet. Wenn inaktiv: TP = nächster Swing High/Low")
+riskRewardRatio = input.float(2.0, "Risk-Reward-Ratio (RRR)", minval=0.5, maxval=10.0, step=0.5, group=GRP_TRADE)
+useTPAtBOS      = input.bool(false, "TP bei BOS setzen", group=GRP_TRADE, tooltip="Wenn aktiv + Festes RRR: TP wird beim BOS gesetzt und SL wird rückwärts vom TP berechnet. RRR bestimmt SL-Abstand zu TP. Wenn inaktiv: Standard-Verhalten (TP beim nächsten Swing)")
+useBreakeven    = input.bool(true,  "Breakeven aktivieren", group=GRP_TRADE, tooltip="Zieht den SL auf Entry (BE) sobald der Preis N×R ins Profit läuft")
+breakevenR      = input.float(1.0,  "Breakeven nach (×R)", minval=0.1, maxval=10.0, step=0.25, group=GRP_TRADE)
+useTrailingSL   = input.bool(false, "Scaling SL aktivieren", group=GRP_TRADE, tooltip="Zieht den SL nach TP1-Hit mit. Modus wird über 'Scaling SL Modus' gewählt.")
+scalingSLMode   = input.string("Swing", "Scaling SL Modus", options=["Swing", "Supertrend"], group=GRP_TRADE, tooltip="Swing: SL folgt bei jedem neuen validierten Swing-Low/High weiter (aktuelle Logik)\nSupertrend: Bei TP1-Hit X% Teilgewinn nehmen (siehe Teilgewinne %), Rest läuft weiter mit SL am Supertrend Band (up/dn Linie)")
+usePartialClose      = input.bool(false, "Partial Close aktivieren", group=GRP_TRADE, tooltip="Wenn aktiv: Bei TP-Hit wird nur ein Teil der Position geschlossen. Der Rest läuft mit Scaling SL weiter bis zum Bruch.")
+partialClosePercent  = input.float(50.0, "Teilgewinne nehmen (%)", minval=1.0, maxval=99.0, step=5.0, group=GRP_TRADE, tooltip="Wie viel % der Position beim TP-Hit geschlossen wird. Der Rest (100 - X%) läuft weiter.")
+tradeDirectionMode        = input.string("Both", "Trade Richtung", options=["Both", "Only Long", "Only Short"], group=GRP_TRADE, tooltip="Both: Long und Short Trades erlaubt\nOnly Long: Nur Long-Trades werden genommen\nOnly Short: Nur Short-Trades werden genommen")
+maxSimultaneousTrades = input.int(1, "Max. gleichzeitige Trades", minval=1, maxval=5, group=GRP_TRADE, tooltip="Wie viele Trades gleichzeitig offen sein dürfen (1-5). Jeder Trade bekommt eine eigene Entry-ID und wird unabhängig gemanagt.")
+useSwingIntactFilter  = input.bool(true, "Kein Entry wenn ST-Flip Swing-Level bricht", group=GRP_TRADE, tooltip="Wenn aktiv: Trade wird übersprungen wenn beim ST-Flip-Bar der Preis das Ziel-Swing bereits komplett gebrochen hat (Long: High ≥ validSH / Short: Low ≤ validSL). Deaktivieren wenn auch späte Entries erlaubt sein sollen.")
+
+const string GRP_HTF = "HTF Timeframe"
+useHTFBias          = input.bool(true, "HTF einschalten", group=GRP_HTF)
+requireHTFAlignment = input.bool(true, "HTF und CTF müssen übereinstimmen", group=GRP_HTF, tooltip="Wenn aktiv: Trades werden nur genommen wenn HTF und CTF (aktueller Timeframe) in die gleiche Richtung zeigen. Wenn inaktiv: Nur HTF-Richtung wird geprüft.")
+htf1min  = input.timeframe("5",   "HTF für 1min Chart",  options=["1", "5", "15", "30", "60", "240", "1D"], group=GRP_HTF)
+htf5min  = input.timeframe("15",  "HTF für 5min Chart",  options=["5", "15", "30", "60", "240", "1D"],       group=GRP_HTF)
+htf15min = input.timeframe("60",  "HTF für 15min Chart", options=["15", "30", "60", "240", "1D"],            group=GRP_HTF)
+htf30min = input.timeframe("60",  "HTF für 30min Chart", options=["30", "60", "240", "1D"],                  group=GRP_HTF)
+htf60min = input.timeframe("240", "HTF für 60min Chart", options=["60", "240", "1D"],                        group=GRP_HTF)
+
+const string GRP_ADX = "HTF ADX Filter"
+useHTFADX         = input.bool(false, "HTF ADX Filter aktivieren", group=GRP_ADX, tooltip="Berechnet den ADX auf dem HTF und kann Trades filtern wenn der ADX unter dem Schwellenwert liegt (kein Trend → kein Trade)")
+useADXTradeFilter = input.bool(true,  "Trades nur bei ADX ≥ Schwellenwert", group=GRP_ADX, tooltip="Wenn aktiv: Trades werden nur genommen wenn HTF ADX ≥ Schwellenwert. Nur relevant wenn HTF ADX Filter aktiviert ist.")
+htfADXTimeframe   = input.timeframe("60", "HTF ADX Timeframe", options=["1", "5", "15", "30", "60", "240", "1D"], group=GRP_ADX)
+adxLength         = input.int(14,   "ADX Länge",         minval=1, maxval=50,             group=GRP_ADX)
+adxSmoothing      = input.int(14,   "ADX Smoothing",     minval=1, maxval=50,             group=GRP_ADX)
+adxMALength       = input.int(5,    "ADX MA Länge",      minval=1, maxval=50,             group=GRP_ADX, tooltip="Glättet den ADX-Verlauf mit einem SMA über N Kerzen")
+adxThreshold      = input.float(20.0, "ADX Schwellenwert", minval=1.0, maxval=100.0, step=1.0, group=GRP_ADX)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STYLE SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const string GRP_STYLE = "🎨 Style / Darstellung"
+
+// --- Supertrend ---
+showSTLines       = input.bool(true,  "Supertrend Linien anzeigen", group=GRP_STYLE)
+stUpColor         = input.color(color.green, "ST Aufwärts Farbe", group=GRP_STYLE)
+stDownColor       = input.color(color.red,   "ST Abwärts Farbe",  group=GRP_STYLE)
+highlighting      = input.bool(true,  "Supertrend Highlighter On/Off", group=GRP_STYLE)
+
+// --- Swing Labels ---
+showBOSLabels     = input.bool(true,  "BOS-Pfeile anzeigen", group=GRP_STYLE)
+bosUpColor        = input.color(color.green, "BOS Aufwärts Pfeil Farbe",  group=GRP_STYLE)
+bosDownColor      = input.color(color.red,   "BOS Abwärts Pfeil Farbe",   group=GRP_STYLE)
+showAllSwings     = input.bool(true,  "LTF Valid Swings anzeigen (kleine Dreiecke)", group=GRP_STYLE)
+showCandidates    = input.bool(true,  "Kandidaten-Labels (S?/L?) anzeigen", group=GRP_STYLE)
+showSTStateLabels = input.bool(false, "ST State Labels (U/D/P + Pullback BOS U/D) anzeigen", group=GRP_STYLE)
+swingHighColor    = input.color(color.red,   "Swing High (H) Label Farbe",   group=GRP_STYLE)
+swingLowColor     = input.color(color.green, "Swing Low (L) Label Farbe",    group=GRP_STYLE)
+swingTimeoutColor = input.color(color.blue,  "Timeout Swing Label Farbe",    group=GRP_STYLE)
+
+// --- EMA ---
+showEMALines      = input.bool(true,  "EMA Linien anzeigen", group=GRP_STYLE)
+emaFastColor      = input.color(color.new(color.yellow, 0), "Schnelle EMA Farbe", group=GRP_STYLE)
+emaSlowColor      = input.color(color.new(color.orange, 0), "Langsame EMA Farbe", group=GRP_STYLE)
+
+// --- Trade Signals ---
+showTradeSignals  = input.bool(true,  "Buy/Short Signal Kreise anzeigen", group=GRP_STYLE)
+buySignalColor    = input.color(color.new(color.green, 0), "Buy Signal Farbe",   group=GRP_STYLE)
+shortSignalColor  = input.color(color.new(color.red,   0), "Short Signal Farbe", group=GRP_STYLE)
+
+// --- Session Hintergrund ---
+londonBgColor     = input.color(color.new(color.blue,   85), "London Session Hintergrund",    group=GRP_STYLE)
+nyBgColor         = input.color(color.new(color.orange, 85), "New York Session Hintergrund",  group=GRP_STYLE)
+asiaBgColor       = input.color(color.new(color.purple, 85), "Asia Session Hintergrund",      group=GRP_STYLE)
+
+// --- HTF Hintergrund ---
+htfUpBgColor      = input.color(color.new(color.green, 85), "HTF Aufwärts Hintergrund",      group=GRP_STYLE)
+htfDownBgColor    = input.color(color.new(color.red,   85), "HTF Abwärts Hintergrund",       group=GRP_STYLE)
+htfMisalignColor  = input.color(color.new(color.gray,  75), "HTF Misaligned Hintergrund",    group=GRP_STYLE)
+
+// --- Consolidation Zones ---
+showConsolidation  = input.bool(true,  "Konsolidierungs-Zonen anzeigen", group=GRP_STYLE, tooltip="Zeigt eine Box wenn der Markt einen Move-Arm ohne BOS beendet (→ Konsolidierung erkannt)")
+consolColor        = input.color(color.new(color.white, 85), "Zone Farbe",         group=GRP_STYLE)
+consolBorderColor  = input.color(color.new(color.white, 30), "Zone Rahmen Farbe",  group=GRP_STYLE)
+consolBufferPct    = input.float(0.0, "Zone Puffer (%)", minval=0.0, maxval=100.0, step=5.0, group=GRP_STYLE, tooltip="Erweitert die Konsolidierungszone symmetrisch um X% der Zone-Range.\nBsp: 20% → Zone wird 120% der Original-Range breit (je 10% nach oben und unten).\nBreakout gilt erst wenn der Preis diese erweiterte Zone bricht.")
+
+htfTimeframe = switch
+    timeframe.period == "1"  => htf1min
+    timeframe.period == "5"  => htf5min
+    timeframe.period == "15" => htf15min
+    timeframe.period == "30" => htf30min
+    timeframe.period == "60" => htf60min
+    => "240"
+
+// LTF: eine Stufe unter dem aktuellen Chart (aus CTF direkt abgeleitet, kein separates Setting)
+ltfTimeframe = switch
+    timeframe.period == "5"  => "1"
+    timeframe.period == "15" => "5"
+    timeframe.period == "30" => "15"
+    timeframe.period == "60" => "30"
+    => "1"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMA CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+emaFast = ta.ema(close, emaFastLength)
+emaSlow = ta.ema(close, emaSlowLength)
+
+// EMA Pullback Touch Tracker – akkumuliert pro Phase, direkt beim Entry gelesen, kein Snapshot
+var bool emaTouchLong      = false  // low < emaSlow während trend==-1  (Preis-Touch für Long)
+var bool emaTouchShort     = false  // high > emaSlow während trend==1   (Preis-Touch für Short)
+var bool emaFastTouchLong  = false  // emaFast < emaSlow während trend==-1 (Fast im Pullback für Long)
+var bool emaFastTouchShort = false  // emaFast > emaSlow während trend==1  (Fast im Pullback für Short)
+var bool emaCrossedBelow   = false  // ta.crossunder(emaFast, emaSlow) während trend==-1 (EMA-Cross für Long)
+var bool emaCrossedAbove   = false  // ta.crossover(emaFast, emaSlow)  während trend==1  (EMA-Cross für Short)
+
+plot(showEMALines ? emaFast : na, title="EMA Fast (21)", color=emaFastColor, linewidth=2)
+plot(showEMALines ? emaSlow : na, title="EMA Slow (120)", color=emaSlowColor, linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPERTREND CALCULATION
+// Berechnet Supertrend (ATR-basierter Trendfolger).
+// trend = 1 (UP/grün) oder -1 (DOWN/rot).
+// buySignal = ST flippt von DOWN auf UP, sellSignal = umgekehrt.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atr2 = ta.sma(ta.tr, stPeriods)
+atr = stChangeATR ? ta.atr(stPeriods) : atr2
+src = hl2
+
+up = src - (stMultiplier * atr)
+up1 = nz(up[1], up)
+up := close[1] > up1 ? math.max(up, up1) : up
+
+dn = src + (stMultiplier * atr)
+dn1 = nz(dn[1], dn)
+dn := close[1] < dn1 ? math.min(dn, dn1) : dn
+
+var int trend = 1
+trend := nz(trend[1], trend)
+trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+
+trendChanged = trend != trend[1]
+buySignal = trend == 1 and trend[1] == -1
+sellSignal = trend == -1 and trend[1] == 1
+
+upPlot = plot(showSTLines and trend == 1 ? up : na, title="Up Trend", style=plot.style_linebr, linewidth=2, color=stUpColor)
+dnPlot = plot(showSTLines and trend == -1 ? dn : na, title="Down Trend", style=plot.style_linebr, linewidth=2, color=stDownColor)
+mPlot = plot(ohlc4, title="", style=plot.style_circles, linewidth=0, display=display.none)
+
+longFillColor  = highlighting ? (trend == 1  ? color.new(stUpColor,   90) : color.new(color.white, 100)) : color.new(color.white, 100)
+shortFillColor = highlighting ? (trend == -1 ? color.new(stDownColor, 90) : color.new(color.white, 100)) : color.new(color.white, 100)
+fill(mPlot, upPlot, title="UpTrend Highlighter", color=longFillColor)
+fill(mPlot, dnPlot, title="DownTrend Highlighter", color=shortFillColor)
+
+// Tracking-Wert abhängig von gewähltem Modus (High/Low, Close, oder Body)
+// Wird verwendet um den höchsten/tiefsten Punkt jeder ST-Phase zu tracken
+trackHigh = swingTrackingMode == "Close" ? close : swingTrackingMode == "Body" ? math.max(close, open) : high
+trackLow  = swingTrackingMode == "Close" ? close : swingTrackingMode == "Body" ? math.min(close, open) : low
+
+var float stTrackedHigh = trackHigh
+var int stTrackedHighBar = bar_index
+var float stTrackedLow = trackLow
+var int stTrackedLowBar = bar_index
+
+if trend == 1
+    if trackHigh > stTrackedHigh or trendChanged
+        stTrackedHigh := trackHigh
+        stTrackedHighBar := bar_index
+else
+    if trackLow < stTrackedLow or trendChanged
+        stTrackedLow := trackLow
+        stTrackedLowBar := bar_index
+
+// lastValidPrice: Extrempunkt der vorherigen ST-Phase (wird bei trendChanged gesetzt)
+// Bei ST DOWN→UP: lastValidPrice = tiefster Punkt der DOWN-Phase (= SL für Long)
+// Bei ST UP→DOWN: lastValidPrice = höchster Punkt der UP-Phase (= SL für Short)
+var float lastValidPrice = na
+var int lastValidBar = na
+var bool lastValidWasHigh = false
+
+if trendChanged and barstate.isconfirmed
+    if trend == -1
+        lastValidPrice := stTrackedHigh[1]
+        lastValidBar := stTrackedHighBar[1]
+        lastValidWasHigh := true
+        stTrackedLow := trackLow
+        stTrackedLowBar := bar_index
+    else
+        lastValidPrice := stTrackedLow[1]
+        lastValidBar := stTrackedLowBar[1]
+        lastValidWasHigh := false
+        stTrackedHigh := trackHigh
+        stTrackedHighBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SWING STRUCTURE CODE
+// Zwei parallele Systeme:
+// 1. AllSwings: Erkennt Swings durch Bruch des vorherigen H/L (AllSwing-Struktur)
+// 2. ValidSwings: ST-basierte Swings (validSH/validSL) – DIESE steuern die Trades
+//
+// isUptrend/isDowntrend = BOS-basierte Trendrichtung (geändert bei BOS UP/DOWN)
+// lastBOS = letzter Break of Structure ("UP", "DOWN", "NONE")
+// bosOccurredInCurrentArm = true wenn im aktuellen ST-Arm ein BOS stattfand
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float allSH = na
+var float allSL = na
+var int   allSHBar = na
+var int   allSLBar = na
+var bool  allInitialized = false
+var bool  allIsUptrend = na
+var bool  allIsDowntrend = na
+var bool  allWaitForPullback = false
+var float allPullbackExtreme = na
+var int   allPullbackExtremeBar = na
+var float allPullbackConfirmLevel = na
+var string allExpectNext = na
+var int allBarsSinceLastSwing = 0
+var float allHighSinceLow = na
+var int allHighSinceLowBar = na
+var float allLowSinceHigh = na
+var int allLowSinceHighBar = na
+
+var bool allNewSHConfirmed = false
+var bool allNewSLConfirmed = false
+var bool allNewSHFromTimeout = false
+var bool allNewSLFromTimeout = false
+
+// validSH/validSL: Die aktuellen validierten Swing-Highs/Lows
+// DIESE bestimmen TP (nächster Swing) und werden für BOS-Erkennung geprüft
+var float validSH = na
+var float validSL = na
+var int   validSHBar = na
+var int   validSLBar = na
+var int   validSHTime = na
+var int   validSLTime = na
+
+var float lastConfirmedSH = na
+var float lastConfirmedSL = na
+var int lastConfirmedSHTime = na
+var int lastConfirmedSLTime = na
+
+var float stCandidateSH = na
+var int   stCandidateSHBar = na
+var float stCandidateSL = na
+var int   stCandidateSLBar = na
+var label stCandidateSHLabel = na
+var label stCandidateSLLabel = na
+
+// BOS-Tracking (Break of Structure)
+// isUptrend/isDowntrend: Wird NUR durch BOS-Events geändert, nicht durch ST-Flips
+// lastBOS: Richtung des letzten BOS ("UP", "DOWN", "NONE")
+var string lastBOS = "NONE"
+var bool isUptrend = false
+var bool isDowntrend = false
+var bool bosOccurredInCurrentArm = false
+var string currentArm = "UNDECIDED"
+var string prevArmState = na
+var int pullbackArmStartBar = na
+var float pullbackArmStartPrice = na
+var bool swingTradedInCurrentArm = false  // One Trade Per Swing: Track if trade already taken in this swing
+
+// Track höchsten Punkt seit letztem validierten LOW (für HIGH-Platzierung bei BOS DOWN)
+var float highSinceLastValidLow = na
+var int highSinceLastValidLowBar = na
+// Track tiefsten Punkt seit letztem validierten HIGH (für LOW-Platzierung bei BOS UP)
+var float lowSinceLastValidHigh = na
+var int lowSinceLastValidHighBar = na
+
+// Valid Swing Timeout
+var int barsSinceLastValidSwing = 0
+var bool timeoutPending = false
+var string lastPlacedSwingType = "NONE"
+var bool lastPlacedSwingWasTimeout = false  // true wenn letzter Swing ein Timeout-Swing war
+
+// Eigenständiger Zwischen-Swing Tracker – wird NUR bei BOS resettet, nie bei ST-Signalen
+// pendingIntermedLow: tiefste Kerze nach Timeout-HIGH bis zum nächsten BOS-UP
+var float pendingIntermedLow = na
+var int   pendingIntermedLowBar = na
+// pendingIntermedHigh: höchste Kerze nach Timeout-LOW bis zum nächsten BOS-DOWN
+var float pendingIntermedHigh = na
+var int   pendingIntermedHighBar = na
+
+// Consolidation Zones
+var box   currentConsolBox = na
+var bool  inConsolidation  = false
+var int   consolStartTime  = na
+var float consolRangeHigh  = na
+var float consolRangeLow   = na
+var float consolBufferedHigh = na  // Erweiterte Obergrenze (inkl. Puffer)
+var float consolBufferedLow  = na  // Erweiterte Untergrenze (inkl. Puffer)
+
+bodyHigh(int idx) => math.max(close[idx], open[idx])
+bodyLow(int idx)  => math.min(close[idx], open[idx])
+isBodyBreaksHigh(float level, int idx) => not na(level) and bodyHigh(idx) > level
+isBodyBreaksLow(float level, int idx)  => not na(level) and bodyLow(idx) < level
+
+f_newLabel(int _bar, float _price, string _text, string _style, color _col) =>
+    // Große Dreiecke für H (▼) und L (▲) mit ATR-Abstand zu den Kerzen, normale Labels für andere
+    float _offset = atr * 0.4
+    if _text == "H"
+        label.new(_bar, _price + _offset, "▼", style=label.style_none, color=color.new(color.white, 100), textcolor=_col, size=size.huge, yloc=yloc.price)
+    else if _text == "L"
+        label.new(_bar, _price - _offset * 2.0, "▲", style=label.style_none, color=color.new(color.white, 100), textcolor=_col, size=size.huge, yloc=yloc.price)
+    else
+        label.new(_bar, _price, _text, style=_style, color=color.new(_col, 20), textcolor=color.new(color.white, 0), size=size.small)
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INITIALISIERUNG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if not allInitialized and bar_index >= initBars and barstate.isconfirmed
+    allSH := ta.highest(high, initBars)
+    allSL := ta.lowest(low, initBars)
+    allSHBar := bar_index[ta.highestbars(high, initBars)]
+    allSLBar := bar_index[ta.lowestbars(low, initBars)]
+    allIsUptrend := high > high[1]
+    allIsDowntrend := not allIsUptrend
+    validSH := allSH
+    validSL := allSL
+    validSHBar := allSHBar
+    validSLBar := allSLBar
+    validSHTime := time[bar_index - allSHBar]
+    validSLTime := time[bar_index - allSLBar]
+    lastConfirmedSH := validSH
+    lastConfirmedSL := validSL
+    lastConfirmedSHTime := validSHTime
+    lastConfirmedSLTime := validSLTime
+    f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingHighColor)
+    f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingLowColor)
+    allInitialized := true
+    allWaitForPullback := false
+    allExpectNext := na
+    allBarsSinceLastSwing := 0
+    allNewSHConfirmed := false
+    allNewSLConfirmed := false
+    allNewSHFromTimeout := false
+    allNewSLFromTimeout := false
+    allHighSinceLow := na
+    allHighSinceLowBar := na
+    allLowSinceHigh := na
+    allLowSinceHighBar := na
+    lastBOS := allIsUptrend ? "UP" : "DOWN"
+    isUptrend := lastBOS == "UP"
+    isDowntrend := lastBOS == "DOWN"
+    stCandidateSH := na
+    stCandidateSHBar := na
+    stCandidateSL := na
+    stCandidateSLBar := na
+    stCandidateSHLabel := na
+    stCandidateSLLabel := na
+    bosOccurredInCurrentArm := false
+    emaCrossedAbove := false
+    emaCrossedBelow := false
+    currentArm := allIsUptrend ? "MOVE_UP" : "MOVE_DOWN"
+    prevArmState := na
+    pullbackArmStartBar := na
+    pullbackArmStartPrice := na
+    highSinceLastValidLow := na
+    highSinceLastValidLowBar := na
+    lowSinceLastValidHigh := na
+    lowSinceLastValidHighBar := na
+    barsSinceLastValidSwing := 0
+    timeoutPending := false
+    lastPlacedSwingType := "NONE"
+    lastPlacedSwingWasTimeout := false
+    pendingIntermedLow := na
+    pendingIntermedLowBar := na
+    pendingIntermedHigh := na
+    pendingIntermedHighBar := na
+    inConsolidation  := false
+    currentConsolBox := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HAUPTLOGIK (läuft jeden Bar nach Initialisierung)
+// Erkennt: AllSwing Breaks, ST-Signale, BOS, Timeouts, Konsolidierung
+// Setzt: validSH/validSL, isUptrend/isDowntrend, bosOccurredInCurrentArm
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if allInitialized and barstate.isconfirmed
+    allBarsSinceLastSwing += 1
+    barsSinceLastValidSwing += 1
+    if useValidSwingTimeout and barsSinceLastValidSwing >= validSwingTimeoutBars
+        timeoutPending := true
+    allNewSHConfirmed := false
+    allNewSLConfirmed := false
+    allNewSHFromTimeout := false
+    allNewSLFromTimeout := false
+    prevArmState := currentArm
+
+    // Track höchsten/tiefsten Punkt zwischen validierten Swings
+    if na(highSinceLastValidLow) or high > highSinceLastValidLow
+        highSinceLastValidLow := high
+        highSinceLastValidLowBar := bar_index
+    if na(lowSinceLastValidHigh) or low < lowSinceLastValidHigh
+        lowSinceLastValidHigh := low
+        lowSinceLastValidHighBar := bar_index
+
+    // Eigenständige Zwischen-Swing Tracker (nur aktiv wenn Timeout-Swing gesetzt)
+    // Werden NICHT von ST-Signalen resettet, nur von BOS
+    if lastPlacedSwingWasTimeout and lastPlacedSwingType == "HIGH"
+        // Nach Timeout-HIGH: tiefste Kerze tracken (für Zwischen-LOW bei BOS-UP)
+        if na(pendingIntermedLow) or low < pendingIntermedLow
+            pendingIntermedLow := low
+            pendingIntermedLowBar := bar_index
+    if lastPlacedSwingWasTimeout and lastPlacedSwingType == "LOW"
+        // Nach Timeout-LOW: höchste Kerze tracken (für Zwischen-HIGH bei BOS-DOWN)
+        if na(pendingIntermedHigh) or high > pendingIntermedHigh
+            pendingIntermedHigh := high
+            pendingIntermedHighBar := bar_index
+
+    // Track allSwings Extrempunkte
+    if na(allHighSinceLow) or high > allHighSinceLow
+        allHighSinceLow := high
+        allHighSinceLowBar := bar_index
+    if na(allLowSinceHigh) or low < allLowSinceHigh
+        allLowSinceHigh := low
+        allLowSinceHighBar := bar_index
+
+    bool detectedBreakAboveSH = false
+    bool detectedBreakBelowSL = false
+    bool detectedPullbackSHConfirm = false
+    bool detectedPullbackSLConfirm = false
+    bool detectedTimeout = false
+    bool detectedSTSellSignal = false
+    bool detectedSTBuySignal = false
+    bool detectedBOSUp = false
+    bool detectedBOSDown = false
+    string newArmState = currentArm
+
+    // ===== ALLSWING PULLBACK TRACKING =====
+    if allWaitForPullback
+        if allExpectNext == "SH"
+            if high > allPullbackExtreme
+                allPullbackExtreme := high
+                allPullbackExtremeBar := bar_index
+                allPullbackConfirmLevel := low
+            if bodyLow(0) < allPullbackConfirmLevel
+                detectedPullbackSHConfirm := true
+        if allExpectNext == "SL"
+            if low < allPullbackExtreme
+                allPullbackExtreme := low
+                allPullbackExtremeBar := bar_index
+                allPullbackConfirmLevel := high
+            if bodyHigh(0) > allPullbackConfirmLevel
+                detectedPullbackSLConfirm := true
+
+    // ===== ALLSWING STRUCTURE BREAKS =====
+    if not allWaitForPullback and isBodyBreaksHigh(allSH, 0)
+        detectedBreakAboveSH := true
+    if not allWaitForPullback and isBodyBreaksLow(allSL, 0)
+        detectedBreakBelowSL := true
+
+    // ===== ALLSWING TIMEOUT =====
+    if not allWaitForPullback and allBarsSinceLastSwing >= timeoutBars and not detectedBreakAboveSH and not detectedBreakBelowSL
+        detectedTimeout := true
+
+    // ===== ST SIGNAL DETECTION =====
+    // useBOSGate=true: Swings nur nach BOS (Standard) | useBOSGate=false: bei jedem ST-Flip (wie alte Strat)
+    // Mindest-Swing-Gate wird nur im BOS-Gate-Modus geprüft – verhindert den gesamten Signal, keinen partiellen Update
+    if sellSignal and not na(stCandidateSH) and (not useBOSGate or bosOccurredInCurrentArm)
+        bool _sellGateOK = true
+        if useBOSGate and useMinSwingGate
+            float _sellLegSize = not na(lastValidPrice) and not na(validSL) ? lastValidPrice - validSL : 0.0
+            _sellGateOK := _sellLegSize >= minSwingATRMult * atr
+        if _sellGateOK
+            detectedSTSellSignal := true
+            if isUptrend
+                newArmState := "PULLBACK_DOWN"
+            else
+                newArmState := "MOVE_DOWN"
+
+    if buySignal and not na(stCandidateSL) and (not useBOSGate or bosOccurredInCurrentArm)
+        bool _buyGateOK = true
+        if useBOSGate and useMinSwingGate
+            float _buyLegSize = not na(validSH) and not na(lastValidPrice) ? validSH - lastValidPrice : 0.0
+            _buyGateOK := _buyLegSize >= minSwingATRMult * atr
+        if _buyGateOK
+            detectedSTBuySignal := true
+            if isDowntrend
+                newArmState := "PULLBACK_UP"
+            else
+                newArmState := "MOVE_UP"
+
+    // ===== BOS DETECTION =====
+    // BOS nur erlauben wenn Supertrend entsprechend gedreht hat!
+    // BOS UP nur wenn ST = 1 (grün), BOS DOWN nur wenn ST = -1 (rot)
+    // BOS nur mit BODY-Break, nicht Wick!
+    if not na(validSH) and bodyHigh(0) > validSH and not bosOccurredInCurrentArm and trend == 1
+        detectedBOSUp := true
+
+    if not na(validSL) and bodyLow(0) < validSL and not bosOccurredInCurrentArm and trend == -1
+        detectedBOSDown := true
+
+    // ===== CONSOLIDATION DETECTION =====
+    bool detectedMoveArmEndWithoutBOS = false
+    if prevArmState == "MOVE_UP" and newArmState == "PULLBACK_DOWN"
+        detectedMoveArmEndWithoutBOS := not bosOccurredInCurrentArm
+    if prevArmState == "MOVE_DOWN" and newArmState == "PULLBACK_UP"
+        detectedMoveArmEndWithoutBOS := not bosOccurredInCurrentArm
+    // Ende der Consol: Preis bricht aus der gepufferten Zone aus (oder BOS)
+    bool consolBreakout = inConsolidation and not na(consolBufferedHigh) and not na(consolBufferedLow) and
+         (bodyHigh(0) > consolBufferedHigh or bodyLow(0) < consolBufferedLow)
+    bool shouldEndConsol = inConsolidation and consolBreakout
+
+    // ===== VALID SWING TIMEOUT DETECTION =====
+    bool detectedTimeoutHigh = false
+    bool detectedTimeoutLow = false
+    if useValidSwingTimeout and timeoutPending and not detectedBOSDown and not detectedBOSUp and not detectedSTSellSignal and not detectedSTBuySignal
+        // Downtrend: HIGH platzieren wenn ST auf DOWN wechselt (sellSignal)
+        if isDowntrend and sellSignal and lastPlacedSwingType != "HIGH" and not na(highSinceLastValidLow)
+            detectedTimeoutHigh := true
+        // Uptrend: LOW platzieren wenn ST auf UP wechselt (buySignal)
+        if isUptrend and buySignal and lastPlacedSwingType != "LOW" and not na(lowSinceLastValidHigh)
+            detectedTimeoutLow := true
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ACTIONS
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    // ===== CONSOLIDATION START =====
+    if detectedMoveArmEndWithoutBOS and not inConsolidation
+        inConsolidation := true
+        if not na(validSH) and not na(validSL) and not na(validSHTime) and not na(validSLTime)
+            consolStartTime := math.min(validSHTime, validSLTime)
+            consolRangeHigh := validSH
+            consolRangeLow  := validSL
+            // Puffer berechnen: X% der Range symmetrisch auf beide Seiten
+            float _consolRange    = validSH - validSL
+            float _consolHalfBuf  = _consolRange * (consolBufferPct / 100.0) / 2.0
+            consolBufferedHigh   := validSH + _consolHalfBuf
+            consolBufferedLow    := validSL - _consolHalfBuf
+            currentConsolBox := na
+
+    // ===== CONSOLIDATION END =====
+    if shouldEndConsol
+        inConsolidation := false
+
+    // ===== BREAK ABOVE allSH =====
+    if detectedBreakAboveSH
+        // Platziere L auf tiefster Kerze seit letztem H
+        if not na(allLowSinceHigh)
+            allSL := allLowSinceHigh
+            allSLBar := allLowSinceHighBar
+            allNewSLConfirmed := true
+        allBarsSinceLastSwing := 0
+        allIsUptrend := true
+        allIsDowntrend := false
+        allWaitForPullback := true
+        allExpectNext := "SH"
+        allPullbackExtreme := high
+        allPullbackExtremeBar := bar_index
+        allPullbackConfirmLevel := low
+        // Reset HIGH-Tracker (neues L platziert → track nächstes H)
+        allHighSinceLow := na
+        allHighSinceLowBar := na
+
+    // ===== BREAK BELOW allSL =====
+    if detectedBreakBelowSL
+        // Platziere H auf höchster Kerze seit letztem L
+        if not na(allHighSinceLow)
+            allSH := allHighSinceLow
+            allSHBar := allHighSinceLowBar
+            allNewSHConfirmed := true
+        allBarsSinceLastSwing := 0
+        allIsUptrend := false
+        allIsDowntrend := true
+        allWaitForPullback := true
+        allExpectNext := "SL"
+        allPullbackExtreme := low
+        allPullbackExtremeBar := bar_index
+        allPullbackConfirmLevel := high
+        // Reset LOW-Tracker (neues H platziert → track nächstes L)
+        allLowSinceHigh := na
+        allLowSinceHighBar := na
+
+    // ===== PULLBACK SH CONFIRM =====
+    if detectedPullbackSHConfirm
+        allSH := allPullbackExtreme
+        allSHBar := allPullbackExtremeBar
+        allNewSHConfirmed := true
+        allWaitForPullback := false
+        allExpectNext := na
+        allBarsSinceLastSwing := 0
+        // Reset LOW-Tracker (neues H platziert → track nächstes L)
+        allLowSinceHigh := na
+        allLowSinceHighBar := na
+
+    // ===== PULLBACK SL CONFIRM =====
+    if detectedPullbackSLConfirm
+        allSL := allPullbackExtreme
+        allSLBar := allPullbackExtremeBar
+        allNewSLConfirmed := true
+        allWaitForPullback := false
+        allExpectNext := na
+        allBarsSinceLastSwing := 0
+        // Reset HIGH-Tracker (neues L platziert → track nächstes H)
+        allHighSinceLow := na
+        allHighSinceLowBar := na
+
+    // ===== TIMEOUT (allSwings) =====
+    if detectedTimeout
+        if allIsUptrend
+            // Force LOW auf tiefster Kerze seit letztem H
+            if not na(allLowSinceHigh)
+                allSL := allLowSinceHigh
+                allSLBar := allLowSinceHighBar
+                allNewSLConfirmed := true
+                allNewSLFromTimeout := true
+                allHighSinceLow := na
+                allHighSinceLowBar := na
+            allBarsSinceLastSwing := 0
+            allWaitForPullback := true
+            allExpectNext := "SH"
+            allPullbackExtreme := high
+            allPullbackExtremeBar := bar_index
+            allPullbackConfirmLevel := low
+        if allIsDowntrend
+            // Force HIGH auf höchster Kerze seit letztem L
+            if not na(allHighSinceLow)
+                allSH := allHighSinceLow
+                allSHBar := allHighSinceLowBar
+                allNewSHConfirmed := true
+                allNewSHFromTimeout := true
+                allLowSinceHigh := na
+                allLowSinceHighBar := na
+            allBarsSinceLastSwing := 0
+            allWaitForPullback := true
+            allExpectNext := "SL"
+            allPullbackExtreme := low
+            allPullbackExtremeBar := bar_index
+            allPullbackConfirmLevel := high
+
+    // ===== VALID SWING TIMEOUT ACTION =====
+    if detectedTimeoutHigh
+        validSH := highSinceLastValidLow
+        validSHBar := highSinceLastValidLowBar
+        validSHTime := time[bar_index - validSHBar]
+        lastConfirmedSH := validSH
+        lastConfirmedSHTime := validSHTime
+        f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingTimeoutColor)
+        barsSinceLastValidSwing := 0
+        timeoutPending := false
+        lastPlacedSwingType := "HIGH"
+        lastPlacedSwingWasTimeout := true
+        // BOS-Flag zurücksetzen: ST-Signale dürfen erst nach neuem BOS feuern
+        bosOccurredInCurrentArm := false
+        // Eigenständigen Zwischen-LOW Tracker starten: tiefste Kerze von Timeout-H-Bar bis heute scannen
+        // (nicht nur low des heutigen Bars – das Tief könnte vor dem sellSignal-Bar liegen!)
+        int _barsAfterTimeoutH = bar_index - validSHBar  // validSHBar = highSinceLastValidLowBar (gerade gesetzt)
+        pendingIntermedLow    := low
+        pendingIntermedLowBar := bar_index
+        if _barsAfterTimeoutH > 0
+            for _i = 0 to _barsAfterTimeoutH - 1
+                if low[_i] < pendingIntermedLow
+                    pendingIntermedLow    := low[_i]
+                    pendingIntermedLowBar := bar_index - _i
+        // LOW-Tracker initialisieren (nicht auf na, damit wir das Zwischen-Low tracken!)
+        lowSinceLastValidHigh    := pendingIntermedLow
+        lowSinceLastValidHighBar := pendingIntermedLowBar
+
+    if detectedTimeoutLow
+        validSL := lowSinceLastValidHigh
+        validSLBar := lowSinceLastValidHighBar
+        validSLTime := time[bar_index - validSLBar]
+        lastConfirmedSL := validSL
+        lastConfirmedSLTime := validSLTime
+        f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingTimeoutColor)
+        barsSinceLastValidSwing := 0
+        timeoutPending := false
+        lastPlacedSwingType := "LOW"
+        lastPlacedSwingWasTimeout := true
+        // BOS-Flag zurücksetzen: ST-Signale dürfen erst nach neuem BOS feuern
+        bosOccurredInCurrentArm := false
+        // Eigenständigen Zwischen-HIGH Tracker starten: höchste Kerze von Timeout-L-Bar bis heute scannen
+        // (nicht nur high des heutigen Bars – das Hoch könnte vor dem buySignal-Bar liegen!)
+        int _barsAfterTimeoutL = bar_index - validSLBar  // validSLBar = lowSinceLastValidHighBar (gerade gesetzt)
+        pendingIntermedHigh    := high
+        pendingIntermedHighBar := bar_index
+        if _barsAfterTimeoutL > 0
+            for _i = 0 to _barsAfterTimeoutL - 1
+                if high[_i] > pendingIntermedHigh
+                    pendingIntermedHigh    := high[_i]
+                    pendingIntermedHighBar := bar_index - _i
+        // HIGH-Tracker initialisieren (nicht auf na, damit wir das Zwischen-High tracken!)
+        highSinceLastValidLow    := pendingIntermedHigh
+        highSinceLastValidLowBar := pendingIntermedHighBar
+
+    // ===== BOS UP =====
+    if detectedBOSUp
+        bool wasAlreadyUptrend = isUptrend
+        bosOccurredInCurrentArm := true
+        swingTradedInCurrentArm := false  // Reset: neue Swing-Phase, trade wieder erlaubt
+        lastBOS := "UP"
+        isUptrend := true
+        isDowntrend := false
+        
+        // TRENDFORTSETZUNG (war schon Uptrend): LOW sofort platzieren
+        // = tiefster Punkt zwischen letztem HIGH und BOS
+        // ST-flip mode: Swings nur bei ST-Signal, BOS aktualisiert nur Richtung
+        if useBOSGate and wasAlreadyUptrend and not na(lowSinceLastValidHigh)
+            // Wenn kein Timeout-L: normaler Fortlauf – ggf. Zwischen-HIGH + neues LOW platzieren
+            if not lastPlacedSwingWasTimeout
+                // Zwischen-HIGH setzen wenn letzter Swing auch ein LOW war
+                if lastPlacedSwingType == "LOW" and not na(highSinceLastValidLow)
+                    validSH := highSinceLastValidLow
+                    validSHBar := highSinceLastValidLowBar
+                    validSHTime := time[bar_index - validSHBar]
+                    lastConfirmedSH := validSH
+                    lastConfirmedSHTime := validSHTime
+                    f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingHighColor)
+                validSL := lowSinceLastValidHigh
+                validSLBar := lowSinceLastValidHighBar
+                validSLTime := time[bar_index - validSLBar]
+                lastConfirmedSL := validSL
+                lastConfirmedSLTime := validSLTime
+                f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingLowColor)
+            // Timeout-L Fortsetzung: H_prev → L_timeout → HH → korrekte Struktur, kein Duplikat-L
+            // reset Tracker in beiden Fällen
+            highSinceLastValidLow := na
+            highSinceLastValidLowBar := na
+            pendingIntermedHigh := na
+            pendingIntermedHighBar := na
+            barsSinceLastValidSwing := 0
+            timeoutPending := false
+            lastPlacedSwingType := "LOW"
+            lastPlacedSwingWasTimeout := false
+            // Cleanup LOW-Kandidat Label
+            if not na(stCandidateSLLabel)
+                label.delete(stCandidateSLLabel)
+                stCandidateSLLabel := na
+            stCandidateSL := na
+            stCandidateSLBar := na
+        // TRENDWECHSEL (war Downtrend, Timeout H aktiv): Zwischen-LOW platzieren
+        // pendingIntermedLow wird von ST-Signalen nicht berührt – zeigt garantiert das tiefste Low seit Timeout-H
+        else if useBOSGate and not wasAlreadyUptrend and lastPlacedSwingWasTimeout and lastPlacedSwingType == "HIGH" and not na(pendingIntermedLow)
+            validSL := pendingIntermedLow
+            validSLBar := pendingIntermedLowBar
+            validSLTime := time[bar_index - validSLBar]
+            lastConfirmedSL := validSL
+            lastConfirmedSLTime := validSLTime
+            f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingLowColor)
+            highSinceLastValidLow := na
+            highSinceLastValidLowBar := na
+            pendingIntermedLow := na
+            pendingIntermedLowBar := na
+            barsSinceLastValidSwing := 0
+            timeoutPending := false
+            lastPlacedSwingType := "LOW"
+            lastPlacedSwingWasTimeout := false
+            // Cleanup LOW-Kandidat Label
+            if not na(stCandidateSLLabel)
+                label.delete(stCandidateSLLabel)
+                stCandidateSLLabel := na
+            stCandidateSL := na
+            stCandidateSLBar := na
+        // TRENDWECHSEL (war Downtrend, kein Timeout): L ist schon vom Downtrend gesetzt → kein neuer Swing
+        else if useBOSGate and not wasAlreadyUptrend
+            lastPlacedSwingWasTimeout := false
+
+    // ===== BOS DOWN =====
+    if detectedBOSDown
+        bool wasAlreadyDowntrend = isDowntrend
+        bosOccurredInCurrentArm := true
+        swingTradedInCurrentArm := false  // Reset: neue Swing-Phase, trade wieder erlaubt
+        lastBOS := "DOWN"
+        isUptrend := false
+        isDowntrend := true
+        
+        // TRENDFORTSETZUNG (war schon Downtrend): HIGH sofort platzieren
+        // = höchster Punkt zwischen letztem LOW und BOS
+        // ST-flip mode: Swings nur bei ST-Signal, BOS aktualisiert nur Richtung
+        if useBOSGate and wasAlreadyDowntrend and not na(highSinceLastValidLow)
+            // Wenn kein Timeout-H: normaler Fortlauf – ggf. Zwischen-LOW + neues HIGH platzieren
+            if not lastPlacedSwingWasTimeout
+                // Zwischen-LOW setzen wenn letzter Swing auch ein HIGH war
+                if lastPlacedSwingType == "HIGH" and not na(lowSinceLastValidHigh)
+                    validSL := lowSinceLastValidHigh
+                    validSLBar := lowSinceLastValidHighBar
+                    validSLTime := time[bar_index - validSLBar]
+                    lastConfirmedSL := validSL
+                    lastConfirmedSLTime := validSLTime
+                    f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingLowColor)
+                validSH := highSinceLastValidLow
+                validSHBar := highSinceLastValidLowBar
+                validSHTime := time[bar_index - validSHBar]
+                lastConfirmedSH := validSH
+                lastConfirmedSHTime := validSHTime
+                f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingHighColor)
+            // Timeout-H Fortsetzung: L_prev → H_timeout → LL → korrekte Struktur, kein Duplikat-H
+            // reset Tracker in beiden Fällen
+            lowSinceLastValidHigh := na
+            lowSinceLastValidHighBar := na
+            pendingIntermedLow := na
+            pendingIntermedLowBar := na
+            barsSinceLastValidSwing := 0
+            timeoutPending := false
+            lastPlacedSwingType := "HIGH"
+            lastPlacedSwingWasTimeout := false
+            // Cleanup HIGH-Kandidat Label
+            if not na(stCandidateSHLabel)
+                label.delete(stCandidateSHLabel)
+                stCandidateSHLabel := na
+            stCandidateSH := na
+            stCandidateSHBar := na
+        // TRENDWECHSEL (war Uptrend, Timeout L aktiv): Zwischen-HIGH platzieren
+        // pendingIntermedHigh wird von ST-Signalen nicht berührt – zeigt garantiert das höchste High seit Timeout-L
+        else if useBOSGate and not wasAlreadyDowntrend and lastPlacedSwingWasTimeout and lastPlacedSwingType == "LOW" and not na(pendingIntermedHigh)
+            validSH := pendingIntermedHigh
+            validSHBar := pendingIntermedHighBar
+            validSHTime := time[bar_index - validSHBar]
+            lastConfirmedSH := validSH
+            lastConfirmedSHTime := validSHTime
+            f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingHighColor)
+            lowSinceLastValidHigh := na
+            lowSinceLastValidHighBar := na
+            pendingIntermedHigh := na
+            pendingIntermedHighBar := na
+            barsSinceLastValidSwing := 0
+            timeoutPending := false
+            lastPlacedSwingType := "HIGH"
+            lastPlacedSwingWasTimeout := false
+            // Cleanup HIGH-Kandidat Label
+            if not na(stCandidateSHLabel)
+                label.delete(stCandidateSHLabel)
+                stCandidateSHLabel := na
+            stCandidateSH := na
+            stCandidateSHBar := na
+        // TRENDWECHSEL (war Uptrend, kein Timeout): H ist schon vom Uptrend gesetzt → kein neuer Swing
+        else if useBOSGate and not wasAlreadyDowntrend
+            lastPlacedSwingWasTimeout := false
+
+    // ===== ST SELL SIGNAL =====
+    if detectedSTSellSignal
+        if useBOSGate
+            // BOS-Gate mode: Extrempunkt bei ST-Flip (Gate bereits in Detection geprüft)
+            validSH := lastValidPrice
+            validSHBar := lastValidBar
+        else
+            // ST-flip mode (wie alte Strat): direkt den höchsten Kandidaten-Preis verwenden
+            validSH := stCandidateSH
+            validSHBar := stCandidateSHBar
+        validSHTime := time[bar_index - validSHBar]
+        lastConfirmedSH := validSH
+        lastConfirmedSHTime := validSHTime
+        stCandidateSH := na
+        stCandidateSHBar := na
+        // Neue DOWN-Phase → LONG-Tracker resetten (frischer Start für Pullback)
+        emaTouchLong      := false
+        emaFastTouchLong  := false
+        emaCrossedBelow   := false
+        currentArm := newArmState
+        if currentArm == "PULLBACK_DOWN"
+            pullbackArmStartBar := bar_index
+            pullbackArmStartPrice := high
+        else
+            pullbackArmStartBar := na
+            pullbackArmStartPrice := na
+        bosOccurredInCurrentArm := false
+        // Reset LOW-Tracker (neues HIGH platziert → track für nächstes LOW)
+        lowSinceLastValidHigh := na
+        lowSinceLastValidHighBar := na
+        barsSinceLastValidSwing := 0
+        timeoutPending := false
+        lastPlacedSwingType := "HIGH"
+        lastPlacedSwingWasTimeout := false
+
+    // ===== ST BUY SIGNAL =====
+    if detectedSTBuySignal
+        if useBOSGate
+            // BOS-Gate mode: Extrempunkt bei ST-Flip (Gate bereits in Detection geprüft)
+            validSL := lastValidPrice
+            validSLBar := lastValidBar
+        else
+            // ST-flip mode (wie alte Strat): direkt den tiefsten Kandidaten-Preis verwenden
+            validSL := stCandidateSL
+            validSLBar := stCandidateSLBar
+        validSLTime := time[bar_index - validSLBar]
+        lastConfirmedSL := validSL
+        lastConfirmedSLTime := validSLTime
+        stCandidateSL := na
+        stCandidateSLBar := na
+        // Neue UP-Phase → SHORT-Tracker resetten (frischer Start für Pullback)
+        emaTouchShort     := false
+        emaFastTouchShort := false
+        emaCrossedAbove   := false
+        currentArm := newArmState
+        if currentArm == "PULLBACK_UP"
+            pullbackArmStartBar := bar_index
+            pullbackArmStartPrice := low
+        else
+            pullbackArmStartBar := na
+            pullbackArmStartPrice := na
+        bosOccurredInCurrentArm := false
+        // Reset HIGH-Tracker (neues LOW platziert → track für nächstes HIGH)
+        highSinceLastValidLow := na
+        highSinceLastValidLowBar := na
+        barsSinceLastValidSwing := 0
+        timeoutPending := false
+        lastPlacedSwingType := "LOW"
+        lastPlacedSwingWasTimeout := false
+
+    // ===== ST CANDIDATE TRACKING =====
+    // Wenn ST wechselt aber Gate blockierte das Signal → Touch-Vars der endenden Phase resetten
+    // (sonst carriert ein alter True-Wert in die nächste Phase über)
+    // Gate-blockierter Trendwechsel: Alten Arm-Tracker der endenden Phase leeren
+    if trendChanged and not detectedSTBuySignal and not detectedSTSellSignal
+        if buySignal
+            emaTouchShort     := false
+            emaFastTouchShort := false
+            emaCrossedAbove   := false
+        if sellSignal
+            emaTouchLong      := false
+            emaFastTouchLong  := false
+            emaCrossedBelow   := false
+
+    // Tracker DOWN-Phase (Pullback für LONG)
+    if trend == -1
+        if low < emaSlow
+            emaTouchLong := true         // Preis berührt slow EMA von oben
+        if emaFast < emaSlow
+            emaFastTouchLong := true     // Fast EMA auf der richtigen Seite
+        if ta.crossunder(emaFast, emaSlow)
+            emaCrossedBelow := true      // Fast EMA kreuzt unter slow EMA (EMA-Cross für Long)
+    
+    // Tracker UP-Phase (Pullback für SHORT)
+    if trend == 1
+        if high > emaSlow
+            emaTouchShort := true        // Preis berührt slow EMA von unten
+        if emaFast > emaSlow
+            emaFastTouchShort := true    // Fast EMA auf der richtigen Seite
+        if ta.crossover(emaFast, emaSlow)
+            emaCrossedAbove := true      // Fast EMA kreuzt über slow EMA (EMA-Cross für Short)
+
+    if trend == 1
+        if na(stCandidateSH) or high > stCandidateSH
+            stCandidateSH := high
+            stCandidateSHBar := bar_index
+    if trend == -1
+        if na(stCandidateSL) or low < stCandidateSL
+            stCandidateSL := low
+            stCandidateSLBar := bar_index
+
+    // ===== CONSOLIDATION BOX DRAWING =====
+    if showConsolidation and inConsolidation and na(currentConsolBox) and not na(consolStartTime)
+        float _top    = not na(consolBufferedHigh) ? consolBufferedHigh : consolRangeHigh
+        float _bottom = not na(consolBufferedLow)  ? consolBufferedLow  : consolRangeLow
+        currentConsolBox := box.new(left=consolStartTime, top=_top, right=time, bottom=_bottom, xloc=xloc.bar_time, bgcolor=consolColor, border_color=consolBorderColor, border_width=1)
+    if showConsolidation and inConsolidation and not na(currentConsolBox)
+        box.set_right(currentConsolBox, time)
+    if showConsolidation and shouldEndConsol and not na(currentConsolBox)
+        box.set_right(currentConsolBox, time)
+        currentConsolBox    := na
+        consolStartTime     := na
+        consolRangeHigh     := na
+        consolRangeLow      := na
+        consolBufferedHigh  := na
+        consolBufferedLow   := na
+
+    // ===== CLEANUP ALTE CANDIDATE LABELS BEI TRENDWECHSEL =====
+    if trendChanged
+        if trend == 1 and not na(stCandidateSLLabel)
+            label.delete(stCandidateSLLabel)
+            stCandidateSLLabel := na
+        if trend == -1 and not na(stCandidateSHLabel)
+            label.delete(stCandidateSHLabel)
+            stCandidateSHLabel := na
+
+    // ===== VALID SWING LABELS =====
+    if detectedSTSellSignal
+        if not na(stCandidateSHLabel)
+            label.delete(stCandidateSHLabel)
+            stCandidateSHLabel := na
+        f_newLabel(validSHBar, validSH, "H", label.style_label_down, swingHighColor)
+
+    if detectedSTBuySignal
+        if not na(stCandidateSLLabel)
+            label.delete(stCandidateSLLabel)
+            stCandidateSLLabel := na
+        f_newLabel(validSLBar, validSL, "L", label.style_label_up, swingLowColor)
+
+    // ===== CANDIDATE LABELS =====
+    if showCandidates
+        if trend == 1 and (na(stCandidateSH[1]) or high > stCandidateSH[1])
+            if not na(stCandidateSHLabel)
+                label.delete(stCandidateSHLabel)
+            stCandidateSHLabel := label.new(stCandidateSHBar, stCandidateSH, "S?", style=label.style_label_down, color=color.new(color.orange, 50), textcolor=color.new(color.white, 30), size=size.tiny)
+        if trend == -1 and (na(stCandidateSL[1]) or low < stCandidateSL[1])
+            if not na(stCandidateSLLabel)
+                label.delete(stCandidateSLLabel)
+            stCandidateSLLabel := label.new(stCandidateSLBar, stCandidateSL, "L?", style=label.style_label_up, color=color.new(color.orange, 50), textcolor=color.new(color.white, 30), size=size.tiny)
+
+    // ===== BOS LABELS (PFEILE!) =====
+    if detectedBOSUp and showBOSLabels
+        label.new(bar_index, low, "↑", style=label.style_none, color=color.new(color.green, 100), textcolor=bosUpColor, size=size.huge, yloc=yloc.belowbar)
+        if prevArmState == "PULLBACK_UP" and showSTStateLabels and not na(pullbackArmStartBar)
+            float offsetPrice = pullbackArmStartPrice - (atr * 2.5)
+            label.new(pullbackArmStartBar, offsetPrice, "U", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small, yloc=yloc.price)
+
+    if detectedBOSDown and showBOSLabels
+        label.new(bar_index, high, "↓", style=label.style_none, color=color.new(color.red, 100), textcolor=bosDownColor, size=size.huge, yloc=yloc.abovebar)
+        if prevArmState == "PULLBACK_DOWN" and showSTStateLabels and not na(pullbackArmStartBar)
+            float offsetPrice = pullbackArmStartPrice + (atr * 2.5)
+            label.new(pullbackArmStartBar, offsetPrice, "D", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small, yloc=yloc.price)
+
+    // ===== ST STATE LABELS =====
+    // U = Uptrend bestätigt | D = Downtrend bestätigt | P = Pullback (ST läuft gegen BOS-Trend)
+    if trendChanged and barstate.isconfirmed and showSTStateLabels
+        bool isPullback = (isUptrend and trend == -1) or (isDowntrend and trend == 1)
+        string stText   = isPullback ? "P" : (trend == 1 ? "U" : "D")
+        color  stColor  = isPullback ? color.orange : (trend == 1 ? color.green : color.red)
+        string stStyle  = trend == 1 ? label.style_label_up : label.style_label_down
+        string stYloc   = trend == 1 ? yloc.belowbar : yloc.abovebar
+        float labelPrice = stYloc == yloc.belowbar ? low : high
+        label.new(bar_index, labelPrice, stText, style=stStyle, color=color.new(stColor, 0), textcolor=color.new(color.white, 0), size=size.small, yloc=stYloc)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LTF VALID SWINGS VISUALIZATION (ersetzt AllSwings Dreiecke)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[ltfValidSH, ltfValidSHTime, ltfValidSL, ltfValidSLTime] = request.security(syminfo.tickerid, ltfTimeframe, [validSH, validSHTime, validSL, validSLTime], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+ltfSHChanged = showAllSwings and not na(ltfValidSHTime) and ltfValidSHTime != nz(ltfValidSHTime[1], -1)
+ltfSLChanged = showAllSwings and not na(ltfValidSLTime) and ltfValidSLTime != nz(ltfValidSLTime[1], -1)
+
+float ltfOffset = atr * 0.4
+
+if ltfSHChanged
+    // Suche den CTF-Bar der den LTF-Swing-Zeitstempel enthält (time[i] <= ltfTime)
+    // Verhindert den 1-Kerzen-Versatz durch xloc.bar_time-Snapping
+    int shBarIdx = bar_index
+    for i = 0 to math.min(bar_index, 300)
+        if time[i] <= ltfValidSHTime
+            shBarIdx := bar_index - i
+            break
+    label.new(x=shBarIdx, y=ltfValidSH + ltfOffset, text="▼", style=label.style_none, color=color.new(color.red, 100), textcolor=color.new(color.red, 15), size=size.tiny, xloc=xloc.bar_index, yloc=yloc.price)
+
+if ltfSLChanged
+    int slBarIdx = bar_index
+    for i = 0 to math.min(bar_index, 300)
+        if time[i] <= ltfValidSLTime
+            slBarIdx := bar_index - i
+            break
+    label.new(x=slBarIdx, y=ltfValidSL - ltfOffset * 2.0, text="▲", style=label.style_none, color=color.new(color.green, 100), textcolor=color.new(color.green, 15), size=size.tiny, xloc=xloc.bar_index, yloc=yloc.price)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION DETECTION (global, für Background + Trade Entry)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool inLondon  = enableLondon and not na(time(timeframe.period, londonSession, "UTC"))
+bool inNY      = enableNY     and not na(time(timeframe.period, nySession, "UTC"))
+bool inAsia    = enableAsia   and not na(time(timeframe.period, asiaSession, "UTC"))
+bool inSession = not useSessionFilter or inLondon or inNY or inAsia
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKGROUND COLOR (Sessions + HTF)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+htfLastBOS = useHTFBias ? request.security(syminfo.tickerid, htfTimeframe, lastBOS, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : lastBOS
+[_adxDiPlus, _adxDiMinus, htfADXValue] = request.security(syminfo.tickerid, htfADXTimeframe, ta.dmi(adxLength, adxSmoothing), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfADXMA = ta.sma(htfADXValue, adxMALength)
+adxPassed = htfADXMA >= adxThreshold
+
+// HTF-Hintergrundfarbe berechnen (einmal, wird in Session- und Nicht-Session-Pfad verwendet)
+bool bgHtfUp         = htfLastBOS == "UP"
+bool bgHtfDown       = htfLastBOS == "DOWN"
+bool bgCtfMatchesHTF = (bgHtfUp and isUptrend) or (bgHtfDown and isDowntrend)
+color computedHTFBg  = na
+if useHTFBias and requireHTFAlignment and not bgCtfMatchesHTF
+    computedHTFBg := htfMisalignColor   // CTF und HTF zeigen nicht in die gleiche Richtung
+else if bgHtfDown
+    computedHTFBg := htfDownBgColor
+else if bgHtfUp
+    computedHTFBg := htfUpBgColor
+
+var color bgCol = na
+if allInitialized
+    // Session-Farben haben Priorität über HTF-Farben
+    if useSessionFilter and (enableLondon or enableNY or enableAsia)
+        if enableLondon and inLondon
+            bgCol := londonBgColor
+        else if enableNY and inNY
+            bgCol := nyBgColor
+        else if enableAsia and inAsia
+            bgCol := asiaBgColor
+        else
+            // Keine aktive Session → HTF-Farbe als Fallback
+            bgCol := computedHTFBg
+    else
+        // Session-Filter aus → nur HTF-Farbe
+        bgCol := computedHTFBg
+
+bgcolor(bgCol)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTROL PANEL (Status Dashboard)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if allInitialized
+    string ctfTrendStr  = isUptrend ? "UP" : "DOWN"
+    color  ctfTrendCol  = isUptrend ? color.new(color.green, 0) : color.new(color.red, 0)
+    
+    string htfBosStr    = htfLastBOS == "UP" ? "UP" : "DOWN"
+    color  htfBosCol    = htfLastBOS == "UP" ? color.new(color.green, 0) : color.new(color.red, 0)
+    
+    bool ctfHtfMatch = (isUptrend and htfLastBOS == "UP") or (isDowntrend and htfLastBOS == "DOWN")
+    string alignStr = not useHTFBias ? "-" : (ctfHtfMatch ? "✓" : "✗")
+    color  alignCol = not useHTFBias ? color.gray : (ctfHtfMatch ? color.new(color.green, 0) : color.new(color.orange, 0))
+    
+    bool emaPass = emaFilterMode == "Deaktiviert" or (isUptrend and emaFast > emaSlow) or (isDowntrend and emaFast < emaSlow)
+    string emaStr = emaFilterMode == "Deaktiviert" ? "-" : (emaPass ? "✓" : "✗")
+    color  emaCol = emaFilterMode == "Deaktiviert" ? color.gray : (emaPass ? color.new(color.green, 0) : color.new(color.red, 0))
+    
+    string adxStr = useHTFADX ? (adxPassed ? "✓" : "✗") : "-"
+    color  adxCol = useHTFADX ? (adxPassed ? color.new(color.green, 0) : color.new(color.red, 0)) : color.gray
+    
+    string sessStr = not useSessionFilter ? "-" : (inSession ? "✓" : "✗")
+    color  sessCol = not useSessionFilter ? color.gray : (inSession ? color.new(color.green, 0) : color.new(color.red, 0))
+    
+    string consolStr = inConsolidation ? "CONSOL" : "--"
+    color  consolCol = inConsolidation ? color.new(color.orange, 0) : color.new(color.gray, 50)
+    
+    string adxValStr = str.tostring(htfADXValue, "#.0") + " / " + str.tostring(htfADXMA, "#.0")
+    string bosStr = bosOccurredInCurrentArm ? "YES" : "NO"
+    
+    // Panel bauen (vertikal gestapelt: 9 Rows, 2 Columns [Label | Value])
+    // table.cell(id, COLUMN, ROW, text) ← PineScript Reihenfolge!
+    var table panelTable = na
+    if na(panelTable)
+        panelTable := table.new(position=position.top_right, rows=9, columns=2, border_width=1, border_color=color.gray, frame_width=1, frame_color=color.gray)
+        table.cell(panelTable, 0, 0, "CTF Trend",  text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 1, "HTF BOS",    text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 2, "CTF/HTF",    text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 3, "EMA Filter", text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 4, "ADX Filter", text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 5, "Session",    text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 6, "Status",     text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 7, "ADX / MA",   text_size=size.small, bgcolor=color.new(color.navy, 50))
+        table.cell(panelTable, 0, 8, "BOS in Arm", text_size=size.small, bgcolor=color.new(color.navy, 50))
+    
+    table.cell(panelTable, 1, 0, ctfTrendStr, text_size=size.small, text_color=ctfTrendCol, bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 1, htfBosStr,   text_size=size.small, text_color=htfBosCol,   bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 2, alignStr,    text_size=size.small, text_color=alignCol,    bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 3, emaStr,      text_size=size.small, text_color=emaCol,      bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 4, adxStr,      text_size=size.small, text_color=adxCol,      bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 5, sessStr,     text_size=size.small, text_color=sessCol,     bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 6, consolStr,   text_size=size.small, text_color=consolCol,   bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 7, adxValStr,   text_size=size.small, text_color=color.white, bgcolor=color.new(color.black, 85))
+    table.cell(panelTable, 1, 8, bosStr,      text_size=size.small, text_color=(bosOccurredInCurrentArm ? color.green : color.red), bgcolor=color.new(color.black, 85))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT (Multi-Slot, max 5 gleichzeitige Trades)
+// Jeder Trade bekommt einen Slot (Index 0..4) mit Entry, TP, SL, Risk, etc.
+// Bei ST-Flip werden Gegenrichtungs-Positionen geschlossen (Slot freigeben).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var int tradeCount = 0
+
+// Arrays – ein Slot pro möglichem Trade (Index 0..4, max 5 Slots hardcoded)
+var array<float>  arr_entry  = array.new<float>(5,  na)
+var array<float>  arr_tp     = array.new<float>(5,  na)
+var array<float>  arr_sl     = array.new<float>(5,  na)
+var array<float>  arr_risk   = array.new<float>(5,  na)
+var array<bool>   arr_be     = array.new<bool>(5,   false)
+var array<bool>   arr_tpHit  = array.new<bool>(5,   false)
+var array<bool>   arr_active = array.new<bool>(5,   false)
+var array<string> arr_dir    = array.new<string>(5, "")
+var array<int>    arr_num    = array.new<int>(5,    0)
+
+// Freien Slot finden (-1 = kein Slot verfügbar)
+f_freeSlot() =>
+    int _s = -1
+    for _i = 0 to maxSimultaneousTrades - 1
+        if not array.get(arr_active, _i)
+            _s := _i
+            break
+    _s
+
+// Prüft ob eine Entry-ID noch unter den offenen Trades ist
+f_isOpen(string _id) =>
+    bool _found = false
+    for _i = 0 to strategy.opentrades - 1
+        if strategy.opentrades.entry_id(_i) == _id
+            _found := true
+            break
+    _found
+
+// ===== SLOT CLEANUP – geschlossene Trades aus Arrays entfernen =====
+for _i = 0 to maxSimultaneousTrades - 1
+    if array.get(arr_active, _i)
+        string _eid = array.get(arr_dir, _i) + str.tostring(array.get(arr_num, _i))
+        if not f_isOpen(_eid)
+            array.set(arr_active, _i, false)
+            array.set(arr_entry,  _i, na)
+            array.set(arr_tp,     _i, na)
+            array.set(arr_sl,     _i, na)
+            array.set(arr_risk,   _i, na)
+            array.set(arr_be,     _i, false)
+            array.set(arr_tpHit,  _i, false)
+            array.set(arr_dir,    _i, "")
+            array.set(arr_num,    _i, 0)
+
+// ===== Bei ST-Flip: Gegenrichtungs-Positionen schließen (Slot freigeben) =====
+// Nur schließen wenn Scaling aktiviert ist UND Breakeven bereits gesetzt wurde
+// Ohne das würde der alte Trade den Slot blockieren und der neue Entry könnte nicht feuern
+if trendChanged and barstate.isconfirmed
+    for _i = 0 to maxSimultaneousTrades - 1
+        if array.get(arr_active, _i)
+            string _flipDir = array.get(arr_dir, _i)
+            bool _opposing = (buySignal and _flipDir == "S") or (sellSignal and _flipDir == "L")
+            bool _canCloseOnFlip = useTrailingSL and array.get(arr_be, _i)
+            if _opposing and _canCloseOnFlip
+                strategy.close(_flipDir + str.tostring(array.get(arr_num, _i)), comment="ST Flip → Close")
+                array.set(arr_active, _i, false)
+                array.set(arr_entry,  _i, na)
+                array.set(arr_tp,     _i, na)
+                array.set(arr_sl,     _i, na)
+                array.set(arr_risk,   _i, na)
+                array.set(arr_be,     _i, false)
+                array.set(arr_tpHit,  _i, false)
+                array.set(arr_dir,    _i, "")
+                array.set(arr_num,    _i, 0)
+
+// Anzahl aktuell aktiver Slots zählen
+int activeSlots = 0
+for _i = 0 to maxSimultaneousTrades - 1
+    if array.get(arr_active, _i)
+        activeSlots += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Trigger: ST-Flip (buySignal / sellSignal), Kerze geschlossen (barstate.isconfirmed)
+//
+// ┌─ RICHTUNG (immer aktiv) ───────────────────────────────────────────────────┐
+// │ Der Hintergrund bestimmt die erlaubte Trade-Richtung:                      │
+// │   Grün  → nur LONG   (HTF UP, oder CTF+HTF UP wenn HTF-Alignment aktiv)   │
+// │   Rot   → nur SHORT  (HTF DOWN, oder CTF+HTF DOWN)                         │
+// │   Grau  → kein Trade (CTF und HTF zeigen in verschiedene Richtungen)       │
+// │   HTF aus → CTF BOS-Trend (isUptrend / isDowntrend) bestimmt Richtung      │
+// ├─ EMA-FILTER (arm-basiert) ─────────────────────────────────────────────────┤
+// │ Bedingung muss IM Pullback-Arm erfüllt worden sein (vor dem ST-Flip):      │
+// │   Preis-Touch:     Preis hat slow EMA während des Arms berührt             │
+// │   EMA-Cross:       Fast EMA hat slow EMA während des Arms GEKREUZT         │
+// │   Fast im Pullback: Fast EMA war auf der richtigen Seite der slow EMA      │
+// ├─ WEITERE FILTER ────────────────────────────────────────────────────────────┤
+// │   ADX          ADX über Schwellenwert (wenn aktiviert)                     │
+// │   SwingIntakt  Preis hat Swing-Ziel noch nicht gebrochen (wenn aktiv)      │
+// │   Session      Innerhalb der aktiven Session (wenn aktiviert)              │
+// │   Konsolidierung  Nicht in erkannter Konsolidierungszone                   │
+// │   TradeRichtung   Long/Short/Both laut Setting                             │
+// │   OnePerSwing  Max. 1 Trade pro Swing-Arm (wenn aktiviert + BOSGate an)    │
+// │   FreierSlot   Weniger als maxSimultaneousTrades aktive Trades             │
+// └────────────────────────────────────────────────────────────────────────────┘
+
+// --- Richtungsfilter: Hintergrundfarbe = erlaubte Trade-Richtung ---
+// HTF aus → CTF BOS-Trend bestimmt (isUptrend/isDowntrend)
+// HTF an, kein Alignment → HTF-BOS allein bestimmt
+// HTF an + Alignment → CTF UND HTF müssen übereinstimmen (= grün/rot Background)
+bool allowLong  = false
+bool allowShort = false
+if not useHTFBias
+    // Kein HTF: CTF BOS-Trend ist die Richtungsbasis
+    allowLong  := isUptrend
+    allowShort := isDowntrend
+else if requireHTFAlignment
+    // Grün = long | Rot = short | Grau = kein Trade
+    allowLong  := isUptrend   and htfLastBOS == "UP"
+    allowShort := isDowntrend and htfLastBOS == "DOWN"
+else
+    // Nur HTF-BOS: CTF-Richtung wird ignoriert
+    allowLong  := htfLastBOS == "UP"
+    allowShort := htfLastBOS == "DOWN"
+
+// --- EMA-Filter (arm-basiert): Bedingung muss im Pullback-Arm erfüllt worden sein ---
+// Die Tracker wurden akkumuliert während des Arms und werden beim Arm-Start resettet.
+//   emaTouchLong/Short     → Preis-Touch Modus
+//   emaCrossedBelow/Above  → EMA-Cross Modus (echter Crossover während des Arms)
+//   emaFastTouchLong/Short → Fast im Pullback Modus
+bool emaAllowsLong  = emaFilterMode == "Deaktiviert" or
+  (emaFilterMode == "Preis-Touch"      and emaTouchLong) or
+  (emaFilterMode == "EMA-Cross"        and emaCrossedBelow) or
+  (emaFilterMode == "Fast im Pullback" and emaFastTouchLong)
+bool emaAllowsShort = emaFilterMode == "Deaktiviert" or
+  (emaFilterMode == "Preis-Touch"      and emaTouchShort) or
+  (emaFilterMode == "EMA-Cross"        and emaCrossedAbove) or
+  (emaFilterMode == "Fast im Pullback" and emaFastTouchShort)
+
+// --- ADX-Filter ---
+bool adxAllows = not useHTFADX or not useADXTradeFilter or adxPassed
+
+// --- Swing-Intakt-Filter ---
+// Blockiert den Trade wenn der ST-Flip-Bar das Swing-Ziel bereits komplett gebrochen hat
+bool swingIntactForLong  = not useSwingIntactFilter or na(validSH) or high < validSH
+bool swingIntactForShort = not useSwingIntactFilter or na(validSL) or low  > validSL
+
+// --- Trade-Richtungs-Modus + One-Trade-Per-Swing ---
+bool longDirectionOK  = tradeDirectionMode != "Only Short"
+bool shortDirectionOK = tradeDirectionMode != "Only Long"
+bool longOneTradeOK   = not (oneTradePerSwing and useBOSGate and swingTradedInCurrentArm)
+bool shortOneTradeOK  = not (oneTradePerSwing and useBOSGate and swingTradedInCurrentArm)
+
+// ===== LONG ENTRY: Supertrend flippt auf UP (buySignal) =====
+// Alle Bedingungen müssen true sein, sonst wird der Trade übersprungen
+bool longEntry = buySignal and barstate.isconfirmed and allowLong and emaAllowsLong and adxAllows and swingIntactForLong and inSession and not inConsolidation and longDirectionOK and longOneTradeOK
+if longEntry
+    int _slot = f_freeSlot()
+    if _slot >= 0 and activeSlots < maxSimultaneousTrades
+        float _sl = not na(lastValidPrice) ? math.min(lastValidPrice, low) : low * 0.98
+        float _tp = not na(validSH) ? validSH : high * 1.02
+        if useFixedRRR and useTPAtBOS
+            // TP bei BOS: SL wird rückwärts vom TP berechnet
+            _tp := not na(validSH) ? validSH : high * 1.02
+            float _tpDist = math.abs(_tp - close)
+            _sl := close - _tpDist / riskRewardRatio
+        else if useFixedRRR
+            float _r = math.abs(close - _sl)
+            _tp := close + _r * riskRewardRatio
+        tradeCount += 1
+        swingTradedInCurrentArm := true  // Mark: Trade taken in this swing arm
+        string _eid = "L" + str.tostring(tradeCount)
+        array.set(arr_entry,  _slot, close)
+        array.set(arr_tp,     _slot, _tp)
+        array.set(arr_sl,     _slot, _sl)
+        array.set(arr_risk,   _slot, math.abs(close - _sl))
+        array.set(arr_be,     _slot, false)
+        array.set(arr_tpHit,  _slot, false)
+        array.set(arr_active, _slot, true)
+        array.set(arr_dir,    _slot, "L")
+        array.set(arr_num,    _slot, tradeCount)
+        if enableTrade1
+            strategy.entry(_eid, strategy.long, qty=strategy.equity * trade1Percent / 100 / close, comment="LONG #" + str.tostring(tradeCount))
+            if usePartialClose or (useTrailingSL and scalingSLMode == "Supertrend")
+                strategy.exit("TP_"  + _eid, from_entry=_eid, qty_percent=partialClosePercent, limit=_tp, stop=_sl, comment="TP #"  + str.tostring(tradeCount))
+                strategy.exit("SL_"  + _eid, from_entry=_eid, stop=_sl,  comment="SL #"  + str.tostring(tradeCount))
+            else if useTrailingSL
+                strategy.exit("TSL_" + _eid, from_entry=_eid, stop=_sl,  comment="SL #"  + str.tostring(tradeCount))
+            else
+                strategy.exit("X_"   + _eid, from_entry=_eid, limit=_tp, stop=_sl, comment="TP/SL #" + str.tostring(tradeCount))
+        if showTradeSignals
+            label.new(bar_index, low, "●", style=label.style_none, color=color.new(buySignalColor, 100), textcolor=buySignalColor, size=size.large, yloc=yloc.belowbar)
+
+// ===== SHORT ENTRY: Supertrend flippt auf DOWN (sellSignal) =====
+// Alle Bedingungen müssen true sein, sonst wird der Trade übersprungen
+bool shortEntry = sellSignal and barstate.isconfirmed and allowShort and emaAllowsShort and adxAllows and swingIntactForShort and inSession and not inConsolidation and shortDirectionOK and shortOneTradeOK
+if shortEntry
+    int _slot = f_freeSlot()
+    if _slot >= 0 and activeSlots < maxSimultaneousTrades
+        float _sl = not na(lastValidPrice) ? math.max(lastValidPrice, high) : high * 1.02
+        float _tp = not na(validSL) ? validSL : low * 0.98
+        if useFixedRRR and useTPAtBOS
+            // TP bei BOS: SL wird rückwärts vom TP berechnet
+            _tp := not na(validSL) ? validSL : low * 0.98
+            float _tpDist = math.abs(close - _tp)
+            _sl := close + _tpDist / riskRewardRatio
+        else if useFixedRRR
+            float _r = math.abs(close - _sl)
+            _tp := close - _r * riskRewardRatio
+        tradeCount += 1
+        swingTradedInCurrentArm := true  // Mark: Trade taken in this swing arm
+        string _eid = "S" + str.tostring(tradeCount)
+        array.set(arr_entry,  _slot, close)
+        array.set(arr_tp,     _slot, _tp)
+        array.set(arr_sl,     _slot, _sl)
+        array.set(arr_risk,   _slot, math.abs(close - _sl))
+        array.set(arr_be,     _slot, false)
+        array.set(arr_tpHit,  _slot, false)
+        array.set(arr_active, _slot, true)
+        array.set(arr_dir,    _slot, "S")
+        array.set(arr_num,    _slot, tradeCount)
+        if enableTrade1
+            strategy.entry(_eid, strategy.short, qty=strategy.equity * trade1Percent / 100 / close, comment="SHORT #" + str.tostring(tradeCount))
+            if usePartialClose or (useTrailingSL and scalingSLMode == "Supertrend")
+                strategy.exit("TP_"  + _eid, from_entry=_eid, qty_percent=partialClosePercent, limit=_tp, stop=_sl, comment="TP #"  + str.tostring(tradeCount))
+                strategy.exit("SL_"  + _eid, from_entry=_eid, stop=_sl,  comment="SL #"  + str.tostring(tradeCount))
+            else if useTrailingSL
+                strategy.exit("TSL_" + _eid, from_entry=_eid, stop=_sl,  comment="SL #"  + str.tostring(tradeCount))
+            else
+                strategy.exit("X_"   + _eid, from_entry=_eid, limit=_tp, stop=_sl, comment="TP/SL #" + str.tostring(tradeCount))
+        if showTradeSignals
+            label.new(bar_index, high, "●", style=label.style_none, color=color.new(shortSignalColor, 100), textcolor=shortSignalColor, size=size.large, yloc=yloc.abovebar)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAKEVEN & TRAILING SL (alle aktiven Slots)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+for _i = 0 to maxSimultaneousTrades - 1
+    if not array.get(arr_active, _i)
+        continue
+    string _dir    = array.get(arr_dir,   _i)
+    int    _num    = array.get(arr_num,   _i)
+    string _eid    = _dir + str.tostring(_num)
+    float  _entry  = array.get(arr_entry, _i)
+    float  _sl     = array.get(arr_sl,    _i)
+    float  _tp     = array.get(arr_tp,    _i)
+    float  _risk   = array.get(arr_risk,  _i)
+    bool   _be     = array.get(arr_be,    _i)
+    bool   _tpHit  = array.get(arr_tpHit, _i)
+    if na(_entry) or na(_sl)
+        continue
+    float _newStop  = _sl
+    bool  _changed  = false
+    bool  _newBe    = _be
+    bool  _newTpHit = _tpHit
+    if _dir == "L"
+        // Breakeven
+        if useBreakeven and not _be and not na(_risk) and _risk > 0
+            if high >= _entry + breakevenR * _risk
+                _newStop := math.max(_newStop, _entry)
+                _newBe   := true
+                _changed := true
+        // Scaling SL
+        if useTrailingSL
+            if not _tpHit and not na(_tp) and high >= _tp
+                _newTpHit := true
+                _newStop  := math.max(_newStop, _entry)
+                _changed  := true
+            if _newTpHit
+                if scalingSLMode == "Swing" and not na(validSL) and validSL > _newStop
+                    _newStop := validSL
+                    _changed := true
+                else if scalingSLMode == "Supertrend" and not na(up) and up > _newStop
+                    _newStop := up
+                    _changed := true
+    else
+        // Breakeven
+        if useBreakeven and not _be and not na(_risk) and _risk > 0
+            if low <= _entry - breakevenR * _risk
+                _newStop := math.min(_newStop, _entry)
+                _newBe   := true
+                _changed := true
+        // Scaling SL
+        if useTrailingSL
+            if not _tpHit and not na(_tp) and low <= _tp
+                _newTpHit := true
+                _newStop  := math.min(_newStop, _entry)
+                _changed  := true
+            if _newTpHit
+                if scalingSLMode == "Swing" and not na(validSH) and validSH < _newStop
+                    _newStop := validSH
+                    _changed := true
+                else if scalingSLMode == "Supertrend" and not na(dn) and dn < _newStop
+                    _newStop := dn
+                    _changed := true
+    if _changed
+        array.set(arr_sl,    _i, _newStop)
+        array.set(arr_be,    _i, _newBe)
+        array.set(arr_tpHit, _i, _newTpHit)
+        // Intelligenter Comment: BE > TP > SL (welcher Event ist aktiv)
+        string _cmt = "SL #" + str.tostring(_num)  // Default = SL
+        if _newBe and not _newTpHit
+            _cmt := "BE #" + str.tostring(_num)
+        else if _newTpHit
+            _cmt := "TP #" + str.tostring(_num)
+        if usePartialClose or (useTrailingSL and scalingSLMode == "Supertrend")
+            strategy.exit("TP_"  + _eid, from_entry=_eid, qty_percent=partialClosePercent, limit=_tp, stop=_newStop, comment="TP #"  + str.tostring(_num))
+            strategy.exit("SL_"  + _eid, from_entry=_eid, stop=_newStop, comment=_cmt)
+        else if useTrailingSL
+            strategy.exit("TSL_" + _eid, from_entry=_eid, stop=_newStop, comment=_cmt)
+        else
+            strategy.exit("X_"   + _eid, from_entry=_eid, limit=_tp, stop=_newStop, comment=_cmt)
+    // Im Scaling-Modus: Comments immer aktualisieren (auch wenn SL sich nicht geändert hat)
+    else if useTrailingSL and array.get(arr_active, _i)
+        string _cmt_always = "SL #" + str.tostring(array.get(arr_num, _i))
+        if array.get(arr_tpHit, _i)
+            _cmt_always := "TP #" + str.tostring(array.get(arr_num, _i))
+        strategy.exit("TSL_" + _eid, from_entry=_eid, stop=array.get(arr_sl, _i), comment=_cmt_always)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END OF CODE
+// ═══════════════════════════════════════════════════════════════════════════════
