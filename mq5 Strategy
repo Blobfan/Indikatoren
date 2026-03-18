@@ -1059,6 +1059,17 @@ void WarmupCTFSupertrend()
           " isUp=", wIsUptrend, " arm=", wArm, " lastBOS=", wLastBOS,
           " lastHigh=", lastUptrendHigh, " lastLow=", lastDowntrendLow,
           " validSH=", wValidSH, " validSL=", wValidSL);
+
+    // FALLBACK: Wenn nach Warmup lastBOS immer noch NONE ist, setze es basierend auf isUptrend/isDowntrend
+    // Dies verhindert, dass der Dashboard dauerhaft NONE anzeigt
+    if(lastBOS == "NONE")
+    {
+        if(isUptrend)
+            lastBOS = "UP";
+        else if(isDowntrend)
+            lastBOS = "DOWN";
+        Print("CTF Warmup Fallback: lastBOS war NONE, gesetzt auf ", lastBOS, " basierend auf Trend-State");
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -1246,6 +1257,17 @@ void WarmupHTFSupertrend()
     htfValidSH = wSH;
     htfValidSL = (wSL == DBL_MAX) ? 0 : wSL;
     htfLastBOS = wBOS;
+
+    // FALLBACK: Wenn nach HTF Warmup htfLastBOS immer noch NONE ist, setze es basierend auf htfTrend
+    if(htfLastBOS == "NONE")
+    {
+        if(wTrend == 1)
+            htfLastBOS = "UP";
+        else if(wTrend == -1)
+            htfLastBOS = "DOWN";
+        Print("HTF Warmup Fallback: htfLastBOS war NONE, gesetzt auf ", htfLastBOS, " basierend auf HTF Trend");
+    }
+
     htfInitialized = true;
     lastHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
 }
@@ -1298,8 +1320,10 @@ void InitializeSwingStructure()
         // Draw initial swing labels in WHITE
         if(InpShowSwingLabels)
         {
-            DrawSwingLabel("SH_" + IntegerToString(TimeCurrent()), validSHBar, validSH, "H", clrWhite, true);
-            DrawSwingLabel("SL_" + IntegerToString(TimeCurrent()), validSLBar, validSL, "L", clrWhite, false);
+            datetime shTime = iTime(_Symbol, PERIOD_CURRENT, validSHBar);
+            datetime slTime = iTime(_Symbol, PERIOD_CURRENT, validSLBar);
+            DrawSwingLabel("SH_" + IntegerToString((int)shTime), validSHBar, validSH, "H", clrWhite, true);
+            DrawSwingLabel("SL_" + IntegerToString((int)slTime), validSLBar, validSL, "L", clrWhite, false);
         }
     }
     // Mit Warmup: isUptrend, isDowntrend, currentArm, lastBOS, bosOccurredInCurrentArm,
@@ -1922,7 +1946,7 @@ void UpdateSupertrendCandidates()
         validSHBar = barIndex;
 
         if(InpShowSwingLabels)
-            DrawSwingLabel("SH_" + IntegerToString(TimeCurrent()), barIndex, lastUptrendHigh, "H", clrRed, true);
+            DrawSwingLabel("SH_" + IntegerToString((int)lastUptrendHighTime), barIndex, lastUptrendHigh, "H", clrRed, true);
 
         if(isUptrend)
         {
@@ -1952,7 +1976,7 @@ void UpdateSupertrendCandidates()
         validSLBar = barIndex;
 
         if(InpShowSwingLabels)
-            DrawSwingLabel("SL_" + IntegerToString(TimeCurrent()), barIndex, lastDowntrendLow, "L", clrGreen, false);
+            DrawSwingLabel("SL_" + IntegerToString((int)lastDowntrendLowTime), barIndex, lastDowntrendLow, "L", clrGreen, false);
 
         if(isDowntrend)
         {
@@ -1982,7 +2006,7 @@ void UpdateSupertrendCandidates()
         validSHBar = barIndex;
 
         if(InpShowSwingLabels)
-            DrawSwingLabel("SH_TO_" + IntegerToString(TimeCurrent()), barIndex, validSH, "H", clrDodgerBlue, true);
+            DrawSwingLabel("SH_TO_" + IntegerToString((int)highSinceLastValidLowTime), barIndex, validSH, "H", clrDodgerBlue, true);
 
         barsSinceLastValidSwing = 0;
         timeoutPending = false;
@@ -2034,7 +2058,7 @@ void UpdateSupertrendCandidates()
         validSLBar = barIndex;
 
         if(InpShowSwingLabels)
-            DrawSwingLabel("SL_TO_" + IntegerToString(TimeCurrent()), barIndex, validSL, "L", clrDodgerBlue, false);
+            DrawSwingLabel("SL_TO_" + IntegerToString((int)lowSinceLastValidHighTime), barIndex, validSL, "L", clrDodgerBlue, false);
 
         barsSinceLastValidSwing = 0;
         timeoutPending = false;
@@ -2556,24 +2580,24 @@ void DrawSwingLabel(string name, int shift, double price, string text, color col
 
     if(isHigh)
     {
-        // Dreieck zeigt nach OBEN (für High) - 180° gedreht
+        // Dreieck zeigt nach UNTEN (für High) - Spitze zeigt auf das High
         time1 = time - timeOffset;
-        price1 = adjustedPrice + triangleSize;
+        price1 = adjustedPrice - triangleSize;
 
         time2 = time + timeOffset;
-        price2 = adjustedPrice + triangleSize;
+        price2 = adjustedPrice - triangleSize;
 
         time3 = time;
         price3 = adjustedPrice;
     }
     else
     {
-        // Dreieck zeigt nach UNTEN (für Low) - 180° gedreht
+        // Dreieck zeigt nach OBEN (für Low) - Spitze zeigt auf das Low
         time1 = time - timeOffset;
-        price1 = adjustedPrice - triangleSize;
+        price1 = adjustedPrice + triangleSize;
 
         time2 = time + timeOffset;
-        price2 = adjustedPrice - triangleSize;
+        price2 = adjustedPrice + triangleSize;
 
         time3 = time;
         price3 = adjustedPrice;
@@ -3230,7 +3254,7 @@ void UpdateHTFSwingStructure()
 
         if(InpShowSwingLabels)
         {
-            DrawHTFSwingLabel("HTF_SH_" + IntegerToString(TimeCurrent()),
+            DrawHTFSwingLabel("HTF_SH_" + IntegerToString((int)htfLastUptrendHighTime),
                             htfBarIndex,
                             htfLastUptrendHigh,
                             "HTF H",
@@ -3249,7 +3273,7 @@ void UpdateHTFSwingStructure()
 
         if(InpShowSwingLabels)
         {
-            DrawHTFSwingLabel("HTF_SL_" + IntegerToString(TimeCurrent()),
+            DrawHTFSwingLabel("HTF_SL_" + IntegerToString((int)htfLastDowntrendLowTime),
                             htfBarIndex,
                             htfLastDowntrendLow,
                             "HTF L",
@@ -3357,24 +3381,24 @@ void DrawHTFSwingLabel(string name, int shift, double price, string text, bool i
 
     if(isHigh)
     {
-        // Dreieck zeigt nach OBEN (für High)
+        // Dreieck zeigt nach UNTEN (für High) - Spitze zeigt auf das High
         time1 = time - timeOffset;
-        price1 = adjustedPrice + triangleSize;
+        price1 = adjustedPrice - triangleSize;
 
         time2 = time + timeOffset;
-        price2 = adjustedPrice + triangleSize;
+        price2 = adjustedPrice - triangleSize;
 
         time3 = time;
         price3 = adjustedPrice;
     }
     else
     {
-        // Dreieck zeigt nach UNTEN (für Low)
+        // Dreieck zeigt nach OBEN (für Low) - Spitze zeigt auf das Low
         time1 = time - timeOffset;
-        price1 = adjustedPrice - triangleSize;
+        price1 = adjustedPrice + triangleSize;
 
         time2 = time + timeOffset;
-        price2 = adjustedPrice - triangleSize;
+        price2 = adjustedPrice + triangleSize;
 
         time3 = time;
         price3 = adjustedPrice;
