@@ -1495,11 +1495,12 @@ void DrawSupertrendLines()
     int bars = Bars(_Symbol, PERIOD_CURRENT);
     int maxBars = MathMin(bars, 500);
 
-    // Delete old supertrend objects
+    // Delete old supertrend objects (only CTF, not HTF)
     for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
     {
         string objName = ObjectName(0, i);
-        if(StringFind(objName, stLinePrefix) >= 0)
+        // Check if it starts with CTF prefix but NOT HTF prefix
+        if(StringFind(objName, stLinePrefix) >= 0 && StringFind(objName, htfStLinePrefix) < 0)
             ObjectDelete(0, objName);
     }
 
