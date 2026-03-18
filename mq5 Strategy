@@ -1,0 +1,3496 @@
+//+------------------------------------------------------------------+
+//|                                           DTFX_Strategy.mq5      |
+//|                        DTFX Structure Swings + Supertrend EA     |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "DTFX"
+#property link      ""
+#property version   "1.01"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- Enums
+enum ENUM_TRAIL_MODE
+{
+   TRAIL_OFF = 0,   // Kein Scaling SL
+   TRAIL_BOS = 1,   // Scaling SL nach Swing-Struktur (BOS)
+   TRAIL_ST  = 2    // Scaling SL am Supertrend nachziehen
+};
+
+enum ENUM_LONG_MODE
+{
+   LONG_OFF      = 0,  // Longs aus
+   LONG_NORMAL   = 1,  // Normal (Buy mit SL & TP)
+   LONG_BUY_HOLD = 2   // Buy & Hold (kein SL/TP)
+};
+
+enum ENUM_CLOSE_MODE
+{
+   CLOSE_OFF       = 0,  // Aus (false)
+   CLOSE_HTF_FLIP  = 1,  // HTF Wechsel zu Downtrend
+   CLOSE_EMA_BREAK = 2   // Slow EMA Break (Kurs schließt darunter)
+};
+
+//--- Input Parameters
+input group "=== Swing Structure ==="
+input int InpWarmupBars = 500;                 // Warm-Up Bars beim Start (Supertrend kalibrieren)
+input bool InpShowSwingLabels = true;          // Swing Labels (H/L) anzeigen
+
+input group "=== Supertrend (Valid Swings) ==="
+input int InpSTperiod = 12;                    // ATR Period
+input double InpSTmultiplier = 5.0;            // ATR Multiplier
+input bool InpShowSupertrendLines = true;      // Supertrend Linien anzeigen
+input int InpSupertrendWidth = 2;              // Supertrend Linienbreite
+input bool InpUseValidSwingTimeout = true;     // Valid Swing Timeout aktivieren
+input int InpValidSwingTimeoutBars = 300;      // Valid Swing Timeout (Kerzen)
+
+input group "=== EMA Settings ==="
+input int InpEMAFast = 21;                                    // Schnelle EMA Länge
+input int InpEMASlow = 120;                                   // Langsame EMA Länge
+input ENUM_TIMEFRAMES InpEMATimeframe = PERIOD_CURRENT;       // EMA Timeframe
+input bool InpShowEMALines = true;                            // EMA Linien anzeigen
+input bool InpUseEMAFilter = true;                            // EMA Filter aktivieren (Preis muss SlowEMA während Pullback berühren)
+input color InpEMAFastColor = clrYellow;                      // Schnelle EMA Farbe
+input color InpEMASlowColor = clrOrange;                      // Langsame EMA Farbe
+input int InpEMAWidth = 2;                                    // EMA Linienbreite
+
+input group "=== Trade Management ==="
+input bool InpEnableTrade = true;              // Trade aktivieren
+input double InpLotSize = 0.1;                 // Lot Size
+input bool InpUseFixedRRR = false;             // Festes RRR verwenden
+input double InpRiskRewardRatio = 2.0;         // Risk-Reward-Ratio (RRR)
+input ENUM_LONG_MODE InpAllowLongTrades = LONG_NORMAL; // Long Trades Modus
+input bool InpAllowShortTrades = true;         // Short Trades erlauben
+input bool InpOnlyOneTradePerSwing = false;    // Nur 1 Trade pro Pullback-Arm (HH/LL)
+input double InpLocalLegATRMultiplier = 3.0;   // Lokales Swing-Bein mind. N x ATR (Chop-Filter)
+
+input group "=== Breakeven & Scaling SL ==="
+input bool             InpUseBreakeven        = true;           // Breakeven aktivieren
+input double           InpBreakevenR          = 1.0;            // Breakeven nach (×R)
+input ENUM_TRAIL_MODE  InpTrailMode           = TRAIL_OFF;      // Scaling SL Modus
+input bool             InpUsePartialClose     = false;          // Partial Close bei TP aktivieren
+input double           InpPartialClosePercent = 50.0;           // Teilgewinne nehmen (% der Position)
+
+input group "=== HTF (Higher Timeframe) ==="
+input bool InpUseHTF = true;                   // HTF aktivieren
+input ENUM_TIMEFRAMES InpHTFTimeframe = PERIOD_H1;  // HTF Timeframe
+input bool InpRequireHTFAlignment = true;      // HTF und CTF müssen übereinstimmen
+input color InpHTFSwingColor = clrDodgerBlue;  // HTF Swing Label Farbe
+input bool InpShowHTFSupertrendLines = true;   // HTF Supertrend Linien anzeigen
+input color InpHTFSupertrendUpColor = clrDodgerBlue;    // HTF Supertrend Up Farbe
+input color InpHTFSupertrendDownColor = clrMagenta;     // HTF Supertrend Down Farbe
+input int InpHTFSupertrendWidth = 3;           // HTF Supertrend Linienbreite
+
+input group "=== Close all positions ==="
+input ENUM_CLOSE_MODE InpCloseMode = CLOSE_OFF;  // Alle Positionen schließen bei
+
+input group "=== ADX Filter ==="
+input bool   InpUseADXFilter    = true;        // ADX Filter aktivieren
+input bool   InpADXTradeFilter  = true;        // Trades nur innerhalb ADX-Bereich
+input ENUM_TIMEFRAMES InpADXTimeframe = PERIOD_CURRENT; // ADX Timeframe (z.B. H1, H4)
+input int    InpADXPeriod       = 14;          // ADX Länge (+DI/-DI/TR RMA, wie ta.dmi diLength)
+input int    InpADXSmoothing    = 14;          // ADX Glättung (RMA von DX, wie ta.dmi adxSmoothing)
+input int    InpADXSmoothing2   = 5;           // Zusätzlicher SMA über ADX (wie ta.sma(adx, n))
+input double InpADXMinimum      = 25.0;        // ADX Minimum (Trend zu schwach darunter)
+input double InpADXMaximum      = 35.0;        // ADX Maximum (Trend zu stark, Overshoot-Risiko)
+
+input group "=== Risk Management ==="
+input double InpStopLossPoints = 0;            // Stop Loss in Points (0 = use swing)
+input double InpTakeProfitPoints = 0;          // Take Profit in Points (0 = use swing)
+
+input group "=== Session Filter ==="
+input bool InpUseSessionFilter = true;         // Session Filter aktivieren
+input bool InpEnableLondon = true;             // London Session aktivieren
+input int  InpLondonStartHour = 7;             // London Start (UTC Stunde)
+input int  InpLondonEndHour   = 16;            // London Ende  (UTC Stunde)
+input bool InpEnableNY = true;                 // New York Session aktivieren
+input int  InpNYStartHour = 13;               // New York Start (UTC Stunde)
+input int  InpNYEndHour   = 22;               // New York Ende  (UTC Stunde)
+input bool InpEnableAsia = false;              // Asia Session aktivieren
+input int  InpAsiaStartHour = 21;             // Asia Start (UTC Stunde)
+input int  InpAsiaEndHour   = 6;              // Asia Ende  (UTC Stunde, über Mitternacht)
+
+input group "=== Stunden Sperren ==="
+input int  InpBlockHour1 = -1;                 // Gesperrte Stunde 1 (-1 = aus, 0-23)
+input int  InpBlockHour2 = -1;                 // Gesperrte Stunde 2 (-1 = aus, 0-23)
+input int  InpBlockHour3 = -1;                 // Gesperrte Stunde 3 (-1 = aus, 0-23)
+input int  InpBlockHour4 = -1;                 // Gesperrte Stunde 4 (-1 = aus, 0-23)
+input int  InpBlockHour5 = -1;                 // Gesperrte Stunde 5 (-1 = aus, 0-23)
+
+input group "=== Display Settings ==="
+input bool InpShowDashboard = true;            // Control Dashboard anzeigen
+input int InpDashboardX = 20;                  // Dashboard X Position
+input int InpDashboardY = 20;                  // Dashboard Y Position
+input color InpDashboardBgColor = clrDarkSlateGray;  // Dashboard Hintergrundfarbe
+input color InpDashboardTextColor = clrWhite;  // Dashboard Textfarbe
+
+//--- Global Variables
+CTrade trade;
+
+// Trade Management
+double tradeEntryPrice   = 0;
+double tradeTargetTP     = 0;
+double tradeStopLoss     = 0;
+double tradeInitialRisk  = 0;
+bool   tradeActive       = false;
+bool   beTriggered       = false;
+bool   tpTriggered       = false;
+bool   isLongTrade       = false;
+bool   partialClosed     = false;
+
+// CSV Logging
+string logFileName = "";
+
+// Indicator Handles
+int emaFastHandle = INVALID_HANDLE;
+int emaSlowHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;
+
+// EMA Close: gespeicherter EMA-Wert für Tick-basierten Preisvergleich
+double g_emaSlowForClose = 0.0;
+
+// Supertrend line object names
+string stLinePrefix = "DTFX_ST_";
+string htfStLinePrefix = "DTFX_HTF_ST_";
+string emaFastLineName = "DTFX_EMA_Fast";
+string emaSlowLineName = "DTFX_EMA_Slow";
+
+// Swing Structure Variables - NUR Valid Swings
+double validSH = 0;
+double validSL = 0;
+int validSHBar = 0;
+int validSLBar = 0;
+bool initialized = false;
+
+// BOS and Trend
+string lastBOS = "NONE";
+bool isUptrend = false;
+bool isDowntrend = false;
+bool bosOccurredInCurrentArm = false;
+string currentArm = "UNDECIDED";
+bool swingLongUsed  = false;  // Long-Trade in aktuellem Pullback-Arm bereits gemacht
+bool swingShortUsed = false;  // Short-Trade in aktuellem Pullback-Arm bereits gemacht
+
+// Valid Swing Extreme Tracking (between validated swings)
+double highSinceLastValidLow = 0;
+datetime highSinceLastValidLowTime = 0;
+double lowSinceLastValidHigh = 0;
+datetime lowSinceLastValidHighTime = 0;
+
+// Valid Swing Timeout
+int barsSinceLastValidSwing = 0;
+bool timeoutPending = false;
+string lastPlacedSwingType = "NONE";
+bool lastPlacedSwingWasTimeout = false;
+bool bosDetectedThisBar = false;  // Prevents ST signal + BOS on same bar
+
+// Pending Intermediate Swings (for timeout→BOS transitions)
+double pendingIntermedLow = 0;
+datetime pendingIntermedLowTime = 0;
+double pendingIntermedHigh = 0;
+datetime pendingIntermedHighTime = 0;
+
+// EMA Touch Tracking
+bool priceWasBelowSlowEMA = false;
+bool priceWasAboveSlowEMA = false;
+
+// EMA Status bei ST-Wechsel (ATOMAR gespeichert)
+bool emaConditionMetAtSTChange = false;
+bool emaConditionMetAtSTChangeShort = false;
+
+// Supertrend Variables
+double upBuffer[];
+double dnBuffer[];
+int trend = 1;
+int prevTrend = 1;
+
+// Supertrend Extreme Tracking - MIT DATETIME STATT BAR-INDEX!
+double currentUptrendHigh = 0;      // Aktuelles höchstes High während Uptrend
+datetime currentUptrendHighTime = 0; // ZEIT des höchsten Highs
+double currentDowntrendLow = 0;     // Aktuelles tiefstes Low während Downtrend
+datetime currentDowntrendLowTime = 0; // ZEIT des tiefsten Lows
+
+double lastUptrendHigh = 0;         // Letztes High VOR dem Wechsel zu Downtrend
+datetime lastUptrendHighTime = 0;   // ZEIT davon
+double lastDowntrendLow = 0;        // Letztes Low VOR dem Wechsel zu Uptrend
+datetime lastDowntrendLowTime = 0;  // ZEIT davon
+
+// Dashboard: Filter-Snapshot zum Zeitpunkt des letzten Trade-Entries
+double dashEntryLeg    = 0;      // LocalLeg beim Entry
+double dashEntryMinLeg = 0;      // MinLeg (N*ATR) beim Entry
+bool   dashEntryLegOK  = false;
+string dashEntryDir    = "-";    // "LONG" oder "SHORT"
+
+// HTF (Higher Timeframe) Variables
+double htfValidSH = 0;               // HTF Swing High
+double htfValidSL = 0;               // HTF Swing Low
+int htfTrend = 1;                    // HTF Supertrend (1=up, -1=down)
+int htfPrevTrend = 1;                // HTF vorheriger Trend
+string htfLastBOS = "NONE";          // HTF BOS Richtung
+bool htfInitialized = false;         // HTF initialisiert?
+datetime lastHTFBarTime = 0;         // Letzte HTF Bar Zeit
+
+// HTF Supertrend Extreme Tracking
+double htfCurrentUptrendHigh = 0;
+datetime htfCurrentUptrendHighTime = 0;
+double htfCurrentDowntrendLow = 0;
+datetime htfCurrentDowntrendLowTime = 0;
+double htfLastUptrendHigh = 0;
+datetime htfLastUptrendHighTime = 0;
+double htfLastDowntrendLow = 0;
+datetime htfLastDowntrendLowTime = 0;
+
+// HTF Indicator Handle
+int htfAtrHandle = INVALID_HANDLE;
+
+// ADX Filter: eigene RMA-Berechnung (exakt wie TradingView ta.dmi)
+// Kein iADX-Handle mehr -- alles manuell
+double adxRmaSmDmPlus  = -1.0;  // RMA(smoothedDMplus,  diLength)  -- -1 = noch nicht init
+double adxRmaSmDmMinus = -1.0;  // RMA(smoothedDMminus, diLength)
+double adxRmaSmTr      = -1.0;  // RMA(TR,              diLength)
+double adxRmaAdx       = -1.0;  // RMA(DX,              adxSmoothing)
+double adxPrevHigh     = 0.0;
+double adxPrevLow      = 0.0;
+double adxPrevClose    = 0.0;
+double adxValue        = 0.0;   // Aktueller ADX-Wert (nach Wilder RMA)
+double adxMA           = 0.0;   // SMA über adxValue (adxMALength Bars)
+double adxMaBuf[];              // Ring-Buffer für SMA
+int    adxMaBufIdx     = 0;
+bool   adxInitialized  = false;
+datetime adxLastBar    = 0;     // Bar-Change-Detection (nur 1x pro Bar updaten!)
+// SMA-Seed Buffer (ta.rma Warmup wie in TradingView)
+double adxSeedBufDmPlus[];
+double adxSeedBufDmMinus[];
+double adxSeedBufTr[];
+int    adxSeedCount    = 0;
+bool   adxRmaSeeded    = false;
+
+// HTF Supertrend Buffers
+double htfUpBuffer[];
+double htfDnBuffer[];
+
+// Dashboard objects
+string dashboardName = "DTFX_Dashboard";
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Initialize indicator handles
+    emaFastHandle = iMA(_Symbol, InpEMATimeframe, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+    emaSlowHandle = iMA(_Symbol, InpEMATimeframe, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+    atrHandle = iATR(_Symbol, PERIOD_CURRENT, InpSTperiod);
+
+    if(emaFastHandle == INVALID_HANDLE || emaSlowHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
+    {
+        Print("Error creating indicator handles!");
+        return INIT_FAILED;
+    }
+
+    // Initialize HTF ATR handle if HTF is enabled
+    if(InpUseHTF)
+    {
+        htfAtrHandle = iATR(_Symbol, InpHTFTimeframe, InpSTperiod);
+        if(htfAtrHandle == INVALID_HANDLE)
+        {
+            Print("Error creating HTF ATR handle!");
+            return INIT_FAILED;
+        }
+    }
+
+    // ADX immer initialisieren (auch wenn Filter aus) -- Dashboard zeigt Wert immer
+    ArrayResize(adxMaBuf, MathMax(InpADXSmoothing2, 1));
+    ArrayInitialize(adxMaBuf, 0.0);
+    ArrayResize(adxSeedBufDmPlus,  InpADXPeriod);
+    ArrayResize(adxSeedBufDmMinus, InpADXPeriod);
+    ArrayResize(adxSeedBufTr,      InpADXPeriod);
+    ArrayInitialize(adxSeedBufDmPlus,  0.0);
+    ArrayInitialize(adxSeedBufDmMinus, 0.0);
+    ArrayInitialize(adxSeedBufTr,      0.0);
+    adxSeedCount   = 0;
+    adxRmaSeeded   = false;
+    adxMaBufIdx    = 0;
+    adxInitialized = false;
+    adxRmaSmDmPlus = adxRmaSmDmMinus = adxRmaSmTr = adxRmaAdx = 0.0;
+    adxPrevHigh = adxPrevLow = adxPrevClose = 0.0;
+    adxLastBar  = 0;
+    PreloadADX();
+
+    // Set array as series
+    ArraySetAsSeries(upBuffer, true);
+    ArraySetAsSeries(dnBuffer, true);
+    ArraySetAsSeries(htfUpBuffer, true);
+    ArraySetAsSeries(htfDnBuffer, true);
+
+    // Initialize variables
+    initialized = false;
+    tradeActive = false;
+
+    // Initialize CSV Logging
+    {
+        string ts = TimeToString(TimeCurrent(), TIME_DATE);
+        StringReplace(ts, ".", "-");
+        logFileName = _Symbol + "_NEW_P" + IntegerToString(PERIOD_CURRENT) + "_" + ts + ".csv";
+        FolderCreate("DTFX_Logs", FILE_COMMON);
+        int fh = FileOpen("DTFX_Logs\\" + logFileName, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+        if(fh != INVALID_HANDLE)
+        {
+            FileWriteString(fh, "DateTime,Strategy,TradeType,Session,EntryPrice,StopLoss,TakeProfit,ValidSH,ValidSL,ATR,AllowDir,EMAAllow,SwingIntact,RangeWide,HTFAlign,ADX\r\n");
+            FileClose(fh);
+            Print("CSV Log: C:\\Users\\arthu\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files\\DTFX_Logs\\", logFileName);
+        }
+        else
+            Print("CSV Log ERROR: konnte Datei nicht erstellen (Error ", GetLastError(), ")");
+    }
+
+    // Create dashboard
+    if(InpShowDashboard)
+        CreateDashboard();
+
+    Print("DTFX Strategy EA initialized successfully");
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Release indicator handles
+    if(emaFastHandle != INVALID_HANDLE) IndicatorRelease(emaFastHandle);
+    if(emaSlowHandle != INVALID_HANDLE) IndicatorRelease(emaSlowHandle);
+    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+    if(htfAtrHandle != INVALID_HANDLE) IndicatorRelease(htfAtrHandle);
+    // ADX: kein Handle, eigene Berechnung
+
+    // Remove all objects created by EA
+    DeleteAllObjects();
+
+    Print("DTFX Strategy EA deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Detect trade close on every tick (before new-bar gate)
+    CheckTradeClose();
+
+    // Manage open trades on EVERY TICK for correct BE/Trailing SL timing
+    ManageOpenTrades();
+
+    // EMA-Break Close: Tick-basierter Preisvergleich gegen gespeicherten EMA-Wert
+    CheckCloseAllTick();
+
+    // Check if new bar
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+
+    if(currentBarTime == lastBarTime)
+    {
+        // Update dashboard even if not new bar
+        if(InpShowDashboard)
+            UpdateDashboard();
+        return;
+    }
+
+    lastBarTime = currentBarTime;
+
+    // Update indicators
+    if(!UpdateIndicators())
+        return;
+
+    // Initialize swing structure on first run
+    if(!initialized && Bars(_Symbol, PERIOD_CURRENT) >= MathMin(InpWarmupBars, 34))
+    {
+        InitializeSwingStructure();
+    }
+
+    // Main logic — use else if so the init bar is NOT processed twice
+    // (InitializeSwingStructure already calls CalculateSupertrend internally)
+    else if(initialized)
+    {
+        CalculateSupertrend();   // FIRST: Calculate ST (needed for trend-gated BOS)
+        UpdateSwingStructure();
+        UpdateSupertrendCandidates();
+        DrawSupertrendLines();
+        DrawEMALines();
+        UpdateADX();
+
+        CheckTradeSignals();
+        CheckCloseAllConditions();
+        // Note: ManageOpenTrades() is already called every tick above
+
+        // Update dashboard
+        if(InpShowDashboard)
+            UpdateDashboard();
+    }
+
+    // === HTF UPDATE (WICHTIG: Nach der Hauptlogik!) ===
+    if(InpUseHTF && initialized)
+    {
+        // Retry HTF initialization each bar until enough HTF bars are available
+        // (CTF initializes after 34 M15 bars, but HTF needs 34 H1 bars = ~24 h later)
+        if(!htfInitialized)
+            InitializeHTFSwingStructure();
+
+        if(htfInitialized)
+            UpdateHTFSwingStructure();
+
+        DrawHTFSupertrendLines();  // Always draw (function exits early silently if no data)
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update all indicators                                            |
+//+------------------------------------------------------------------+
+bool UpdateIndicators()
+{
+    // Nur ATR muss bereit sein (Supertrend + Swings brauchen ihn)
+    // EMA-Handles können auf anderem Timeframe laufen → werden dort geprüft wo sie genutzt werden
+    if(BarsCalculated(atrHandle) < 1)
+        return false;
+    return true;
+}
+
+// Wilder's RMA (Running Moving Average): exakt wie ta.rma() in Pine
+// alpha = 1/length  ->  rma = rma_prev + alpha*(value - rma_prev)
+double WilderRMA(double prevRMA, double value, int length)
+{
+    return prevRMA + (value - prevRMA) / length;
+}
+
+// Berechnet ADX rückwirkend aus History -- kein null-Wert beim Start
+void PreloadADX()
+{
+    int totalBars = iBars(_Symbol, InpADXTimeframe);
+    if(totalBars < 2) return;
+    int warmup   = (InpADXPeriod + InpADXSmoothing) * 3;
+    int lookback = MathMin(totalBars - 1, warmup + 2);
+
+    adxPrevHigh  = iHigh (_Symbol, InpADXTimeframe, lookback);
+    adxPrevLow   = iLow  (_Symbol, InpADXTimeframe, lookback);
+    adxPrevClose = iClose(_Symbol, InpADXTimeframe, lookback);
+    adxInitialized = true;
+
+    for(int i = lookback - 1; i >= 1; i--)
+    {
+        double h = iHigh (_Symbol, InpADXTimeframe, i);
+        double l = iLow  (_Symbol, InpADXTimeframe, i);
+        double c = iClose(_Symbol, InpADXTimeframe, i);
+        double upMove   = h - adxPrevHigh;
+        double downMove = adxPrevLow - l;
+        double plusDM   = (upMove > downMove && upMove > 0)   ? upMove   : 0.0;
+        double minusDM  = (downMove > upMove && downMove > 0) ? downMove : 0.0;
+        double tr = MathMax(h - l, MathMax(MathAbs(h - adxPrevClose), MathAbs(l - adxPrevClose)));
+        adxPrevHigh = h; adxPrevLow = l; adxPrevClose = c;
+
+        if(!adxRmaSeeded)
+        {
+            int idx = adxSeedCount % InpADXPeriod;
+            adxSeedBufDmPlus[idx]  = plusDM;
+            adxSeedBufDmMinus[idx] = minusDM;
+            adxSeedBufTr[idx]      = tr;
+            adxSeedCount++;
+            if(adxSeedCount >= InpADXPeriod)
+            {
+                double sumDmP = 0, sumDmM = 0, sumTr = 0;
+                for(int j = 0; j < InpADXPeriod; j++)
+                { sumDmP += adxSeedBufDmPlus[j]; sumDmM += adxSeedBufDmMinus[j]; sumTr += adxSeedBufTr[j]; }
+                adxRmaSmDmPlus  = sumDmP / InpADXPeriod;
+                adxRmaSmDmMinus = sumDmM / InpADXPeriod;
+                adxRmaSmTr      = sumTr  / InpADXPeriod;
+                double diP_s    = (adxRmaSmTr > 0) ? 100.0 * adxRmaSmDmPlus  / adxRmaSmTr : 0.0;
+                double diM_s    = (adxRmaSmTr > 0) ? 100.0 * adxRmaSmDmMinus / adxRmaSmTr : 0.0;
+                double diS_s    = diP_s + diM_s;
+                adxRmaAdx       = (diS_s == 0) ? 0.0 : 100.0 * MathAbs(diP_s - diM_s) / diS_s;
+                adxRmaSeeded    = true;
+            }
+        }
+        else
+        {
+            adxRmaSmDmPlus  = WilderRMA(adxRmaSmDmPlus,  plusDM,  InpADXPeriod);
+            adxRmaSmDmMinus = WilderRMA(adxRmaSmDmMinus, minusDM, InpADXPeriod);
+            adxRmaSmTr      = WilderRMA(adxRmaSmTr,      tr,      InpADXPeriod);
+            if(adxRmaSmTr > 0)
+            {
+                double diPlus  = 100.0 * adxRmaSmDmPlus  / adxRmaSmTr;
+                double diMinus = 100.0 * adxRmaSmDmMinus / adxRmaSmTr;
+                double diSum   = diPlus + diMinus;
+                double dx      = (diSum == 0) ? 0.0 : 100.0 * MathAbs(diPlus - diMinus) / diSum;
+                adxRmaAdx      = WilderRMA(adxRmaAdx, dx, InpADXSmoothing);
+            }
+        }
+    }
+    if(adxRmaSeeded)
+    {
+        adxValue = adxRmaAdx;
+        int maLen = MathMax(InpADXSmoothing2, 1);
+        ArrayResize(adxMaBuf, maLen);
+        ArrayInitialize(adxMaBuf, adxValue);
+        adxMaBufIdx = maLen;
+        adxMA = adxValue;
+    }
+    adxLastBar = iTime(_Symbol, InpADXTimeframe, 1);
+}
+
+void UpdateADX()
+{
+    // Immer berechnen (auch wenn Filter aus) -- Wert wird im Dashboard angezeigt
+    // Nur einmal pro geschlossener Bar berechnen
+    datetime barTime = iTime(_Symbol, InpADXTimeframe, 1);
+    if(barTime == adxLastBar) return;
+    adxLastBar = barTime;
+
+    double high1  = iHigh (_Symbol, InpADXTimeframe, 1);
+    double low1   = iLow  (_Symbol, InpADXTimeframe, 1);
+    double close1 = iClose(_Symbol, InpADXTimeframe, 1);
+
+    // Allererste Bar: nur Prev-Werte speichern
+    if(!adxInitialized)
+    {
+        adxPrevHigh  = high1;
+        adxPrevLow   = low1;
+        adxPrevClose = close1;
+        adxInitialized = true;
+        return;
+    }
+
+    // === Directional Movement ===
+    double upMove   = high1      - adxPrevHigh;
+    double downMove = adxPrevLow - low1;
+    double plusDM   = (upMove > downMove && upMove > 0)   ? upMove   : 0.0;
+    double minusDM  = (downMove > upMove && downMove > 0) ? downMove : 0.0;
+
+    // === True Range ===
+    double tr = MathMax(high1 - low1,
+                MathMax(MathAbs(high1 - adxPrevClose),
+                        MathAbs(low1  - adxPrevClose)));
+
+    adxPrevHigh  = high1;
+    adxPrevLow   = low1;
+    adxPrevClose = close1;
+
+    // === Phase 1: SMA-Seed (ta.rma Warmup: erste InpADXPeriod Bars als SMA seeden) ===
+    if(!adxRmaSeeded)
+    {
+        int idx = adxSeedCount % InpADXPeriod;
+        adxSeedBufDmPlus[idx]  = plusDM;
+        adxSeedBufDmMinus[idx] = minusDM;
+        adxSeedBufTr[idx]      = tr;
+        adxSeedCount++;
+
+        if(adxSeedCount >= InpADXPeriod)
+        {
+            double sumDmP = 0, sumDmM = 0, sumTr = 0;
+            for(int i = 0; i < InpADXPeriod; i++)
+            {
+                sumDmP += adxSeedBufDmPlus[i];
+                sumDmM += adxSeedBufDmMinus[i];
+                sumTr  += adxSeedBufTr[i];
+            }
+            adxRmaSmDmPlus  = sumDmP / InpADXPeriod;
+            adxRmaSmDmMinus = sumDmM / InpADXPeriod;
+            adxRmaSmTr      = sumTr  / InpADXPeriod;
+
+            double diP_s = (adxRmaSmTr > 0) ? 100.0 * adxRmaSmDmPlus  / adxRmaSmTr : 0.0;
+            double diM_s = (adxRmaSmTr > 0) ? 100.0 * adxRmaSmDmMinus / adxRmaSmTr : 0.0;
+            double diS_s = diP_s + diM_s;
+            adxRmaAdx = (diS_s == 0) ? 0.0 : 100.0 * MathAbs(diP_s - diM_s) / diS_s;
+
+            adxRmaSeeded = true;
+        }
+        adxValue = 0.0;
+        adxMA    = 0.0;
+        return;
+    }
+
+    // === Phase 2: Wilder-RMA (wie ta.rma in Pine) ===
+    adxRmaSmDmPlus  = WilderRMA(adxRmaSmDmPlus,  plusDM,  InpADXPeriod);
+    adxRmaSmDmMinus = WilderRMA(adxRmaSmDmMinus, minusDM, InpADXPeriod);
+    adxRmaSmTr      = WilderRMA(adxRmaSmTr,      tr,      InpADXPeriod);
+
+    if(adxRmaSmTr == 0) return;
+
+    double diPlus  = 100.0 * adxRmaSmDmPlus  / adxRmaSmTr;
+    double diMinus = 100.0 * adxRmaSmDmMinus / adxRmaSmTr;
+    double diSum   = diPlus + diMinus;
+    double dx      = (diSum == 0) ? 0.0 : 100.0 * MathAbs(diPlus - diMinus) / diSum;
+
+    adxRmaAdx = WilderRMA(adxRmaAdx, dx, InpADXSmoothing);
+    adxValue  = adxRmaAdx;
+
+    // === Optionaler SMA über ADX ===
+    int maLen = MathMax(InpADXSmoothing2, 1);
+    adxMaBuf[adxMaBufIdx % maLen] = adxValue;
+    adxMaBufIdx++;
+    double sum = 0;
+    int    cnt = MathMin(adxMaBufIdx, maLen);
+    for(int i = 0; i < cnt; i++) sum += adxMaBuf[i];
+    adxMA = (cnt > 0) ? sum / cnt : 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Warmup: CTF Supertrend – volle Live-Simulation aus Historie      |
+//+------------------------------------------------------------------+
+void WarmupCTFSupertrend()
+{
+    int count = MathMin(InpWarmupBars + 3, Bars(_Symbol, PERIOD_CURRENT));
+    if(count < 4) return;
+
+    double atr[], hi[], lo[], cl[], op[];
+    datetime tm[];
+    ArraySetAsSeries(atr, true); ArraySetAsSeries(hi, true);
+    ArraySetAsSeries(lo,  true); ArraySetAsSeries(cl, true);
+    ArraySetAsSeries(op,  true); ArraySetAsSeries(tm, true);
+
+    if(CopyBuffer(atrHandle, 0, 0, count, atr) < count) return;
+    if(CopyHigh  (_Symbol, PERIOD_CURRENT, 0, count, hi ) < count) return;
+    if(CopyLow   (_Symbol, PERIOD_CURRENT, 0, count, lo ) < count) return;
+    if(CopyClose (_Symbol, PERIOD_CURRENT, 0, count, cl ) < count) return;
+    if(CopyOpen  (_Symbol, PERIOD_CURRENT, 0, count, op ) < count) return;
+    if(CopyTime  (_Symbol, PERIOD_CURRENT, 0, count, tm ) < count) return;
+
+    double prevUp = 0, prevDn = 0;
+    int    wTrend = 1;
+    currentUptrendHigh = 0;  currentUptrendHighTime = 0;
+    currentDowntrendLow = 0; currentDowntrendLowTime = 0;
+    lastUptrendHigh = 0;     lastUptrendHighTime = 0;
+    lastDowntrendLow = 0;    lastDowntrendLowTime = 0;
+
+    // Arm/BOS-State – simuliert UpdateSwingStructure + UpdateSupertrendCandidates
+    string   wArm         = "UNDECIDED";
+    bool     wIsUptrend   = true;
+    bool     wIsDowntrend = false;
+    bool     wBosInArm    = false;
+    string   wLastBOS     = "NONE";
+    double   wValidSH     = 0,  wValidSL     = 0;
+    datetime wValidSHTime = 0,  wValidSLTime = 0;
+
+    // Extreme tracking between validated swings
+    double   wHighSinceLastValidLow     = 0;
+    datetime wHighSinceLastValidLowTime = 0;
+    double   wLowSinceLastValidHigh     = 0;
+    datetime wLowSinceLastValidHighTime = 0;
+
+    // Timeout tracking
+    int      wBarsSinceLastValidSwing = 0;
+    bool     wTimeoutPending          = false;
+    string   wLastPlacedSwingType     = "NONE";
+    bool     wLastPlacedSwingWasTimeout = false;
+
+    // Pending intermediate tracking
+    double   wPendingIntermedLow      = 0;
+    datetime wPendingIntermedLowTime  = 0;
+    double   wPendingIntermedHigh     = 0;
+    datetime wPendingIntermedHighTime = 0;
+
+    for(int i = count - 1; i >= 2; i--)
+    {
+        double h1     = hi[i];
+        double l1     = lo[i];
+        double c1     = cl[i];
+        double o1     = op[i];
+        double c_prev = (i + 1 < count) ? cl[i + 1] : c1;
+
+        double src = (h1 + l1) / 2.0;
+        double up  = src - InpSTmultiplier * atr[i];
+        double dn  = src + InpSTmultiplier * atr[i];
+
+        if(prevUp > 0)
+        {
+            if(c_prev > prevUp) up = MathMax(up, prevUp);
+            if(c_prev < prevDn) dn = MathMin(dn, prevDn);
+        }
+
+        // === STEP 1: EXTREMPUNKTE TRACKING MIT ALTEM TREND (VOR Trend-Bestimmung!) ===
+        if(wTrend == 1  && (h1 > currentUptrendHigh || currentUptrendHigh == 0))
+            { currentUptrendHigh = h1;  currentUptrendHighTime = tm[i]; }
+        if(wTrend == -1 && (l1 < currentDowntrendLow || currentDowntrendLow == 0))
+            { currentDowntrendLow = l1; currentDowntrendLowTime = tm[i]; }
+
+        // === STEP 2: TREND BESTIMMEN ===
+        int prevTrendW = wTrend;
+        if(wTrend == -1 && c1 > prevDn)     wTrend = 1;
+        else if(wTrend == 1 && c1 < prevUp) wTrend = -1;
+
+        // === STEP 3: BEI TRENDWECHSEL: SPEICHERE EXTREMPUNKTE ===
+        if(wTrend != prevTrendW)
+        {
+            if(wTrend == -1)
+            {
+                lastUptrendHigh = currentUptrendHigh;
+                lastUptrendHighTime = currentUptrendHighTime;
+                currentDowntrendLow = l1; currentDowntrendLowTime = tm[i];
+            }
+            else
+            {
+                lastDowntrendLow = currentDowntrendLow;
+                lastDowntrendLowTime = currentDowntrendLowTime;
+                currentUptrendHigh = h1; currentUptrendHighTime = tm[i];
+            }
+        }
+
+        // === UpdateSwingStructure Simulation ===
+        wBarsSinceLastValidSwing++;
+        bool wBosDetectedThisBar = false;
+
+        if(InpUseValidSwingTimeout && wBarsSinceLastValidSwing >= InpValidSwingTimeoutBars)
+            wTimeoutPending = true;
+
+        double bodyHi = MathMax(c1, o1);
+        double bodyLo = MathMin(c1, o1);
+
+        // Extreme tracking between validated swings
+        if(wHighSinceLastValidLow == 0 || h1 > wHighSinceLastValidLow)
+            { wHighSinceLastValidLow = h1; wHighSinceLastValidLowTime = tm[i]; }
+        if(wLowSinceLastValidHigh == 0 || l1 < wLowSinceLastValidHigh)
+            { wLowSinceLastValidHigh = l1; wLowSinceLastValidHighTime = tm[i]; }
+
+        // Pending intermediate tracking
+        if(wLastPlacedSwingWasTimeout && wLastPlacedSwingType == "HIGH")
+        {
+            if(wPendingIntermedLow == 0 || l1 < wPendingIntermedLow)
+                { wPendingIntermedLow = l1; wPendingIntermedLowTime = tm[i]; }
+        }
+        if(wLastPlacedSwingWasTimeout && wLastPlacedSwingType == "LOW")
+        {
+            if(wPendingIntermedHigh == 0 || h1 > wPendingIntermedHigh)
+                { wPendingIntermedHigh = h1; wPendingIntermedHighTime = tm[i]; }
+        }
+
+        // BOS detection (gated by trend direction)
+        bool detectedBOSUp   = (wValidSH > 0 && bodyHi > wValidSH && !wBosInArm && wTrend == 1);
+        bool detectedBOSDown = (wValidSL > 0 && bodyLo < wValidSL && !wBosInArm && wTrend == -1);
+
+        // === BOS UP ACTIONS ===
+        if(detectedBOSUp)
+        {
+            bool wasAlreadyUptrend = wIsUptrend;
+            wBosInArm = true;
+            wBosDetectedThisBar = true;
+            wLastBOS = "UP";
+            wIsUptrend = true;
+            wIsDowntrend = false;
+
+            if(wasAlreadyUptrend && wLowSinceLastValidHigh > 0)
+            {
+                if(!wLastPlacedSwingWasTimeout)
+                {
+                    if(wLastPlacedSwingType == "LOW" && wHighSinceLastValidLow > 0)
+                    {
+                        wValidSH = wHighSinceLastValidLow;
+                        wValidSHTime = wHighSinceLastValidLowTime;
+                        if(InpShowSwingLabels)
+                        {
+                            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                            DrawSwingLabel("SH_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrRed, true);
+                        }
+                    }
+                    wValidSL = wLowSinceLastValidHigh;
+                    wValidSLTime = wLowSinceLastValidHighTime;
+                    if(InpShowSwingLabels)
+                    {
+                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                        DrawSwingLabel("SL_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrGreen, false);
+                    }
+                }
+                wHighSinceLastValidLow = 0; wHighSinceLastValidLowTime = 0;
+                wPendingIntermedHigh = 0; wPendingIntermedHighTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "LOW"; wLastPlacedSwingWasTimeout = false;
+            }
+            else if(!wasAlreadyUptrend && wLastPlacedSwingWasTimeout && wLastPlacedSwingType == "HIGH" && wPendingIntermedLow > 0)
+            {
+                wValidSL = wPendingIntermedLow;
+                wValidSLTime = wPendingIntermedLowTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wPendingIntermedLowTime);
+                    DrawSwingLabel("SL_" + IntegerToString((int)wPendingIntermedLowTime), barIdx, wValidSL, "L", clrGreen, false);
+                }
+                wHighSinceLastValidLow = 0; wHighSinceLastValidLowTime = 0;
+                wPendingIntermedLow = 0; wPendingIntermedLowTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "LOW"; wLastPlacedSwingWasTimeout = false;
+            }
+            else if(!wasAlreadyUptrend) { wLastPlacedSwingWasTimeout = false; }
+        }
+
+        // === BOS DOWN ACTIONS ===
+        if(detectedBOSDown)
+        {
+            bool wasAlreadyDowntrend = wIsDowntrend;
+            wBosInArm = true;
+            wBosDetectedThisBar = true;
+            wLastBOS = "DOWN";
+            wIsUptrend = false;
+            wIsDowntrend = true;
+
+            if(wasAlreadyDowntrend && wHighSinceLastValidLow > 0)
+            {
+                if(!wLastPlacedSwingWasTimeout)
+                {
+                    if(wLastPlacedSwingType == "HIGH" && wLowSinceLastValidHigh > 0)
+                    {
+                        wValidSL = wLowSinceLastValidHigh;
+                        wValidSLTime = wLowSinceLastValidHighTime;
+                        if(InpShowSwingLabels)
+                        {
+                            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                            DrawSwingLabel("SL_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrGreen, false);
+                        }
+                    }
+                    wValidSH = wHighSinceLastValidLow;
+                    wValidSHTime = wHighSinceLastValidLowTime;
+                    if(InpShowSwingLabels)
+                    {
+                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                        DrawSwingLabel("SH_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrRed, true);
+                    }
+                }
+                wLowSinceLastValidHigh = 0; wLowSinceLastValidHighTime = 0;
+                wPendingIntermedLow = 0; wPendingIntermedLowTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "HIGH"; wLastPlacedSwingWasTimeout = false;
+            }
+            else if(!wasAlreadyDowntrend && wLastPlacedSwingWasTimeout && wLastPlacedSwingType == "LOW" && wPendingIntermedHigh > 0)
+            {
+                wValidSH = wPendingIntermedHigh;
+                wValidSHTime = wPendingIntermedHighTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wPendingIntermedHighTime);
+                    DrawSwingLabel("SH_" + IntegerToString((int)wPendingIntermedHighTime), barIdx, wValidSH, "H", clrRed, true);
+                }
+                wLowSinceLastValidHigh = 0; wLowSinceLastValidHighTime = 0;
+                wPendingIntermedHigh = 0; wPendingIntermedHighTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "HIGH"; wLastPlacedSwingWasTimeout = false;
+            }
+            else if(!wasAlreadyDowntrend) { wLastPlacedSwingWasTimeout = false; }
+        }
+
+        // === UpdateSupertrendCandidates Simulation (nur bei ST-Flip) ===
+        if(wTrend != prevTrendW)
+        {
+            bool buySignal  = (wTrend == 1  && prevTrendW == -1);
+            bool sellSignal = (wTrend == -1 && prevTrendW == 1);
+
+            bool detectedSTSellSignal = (sellSignal && lastUptrendHigh > 0 && wBosInArm && !wBosDetectedThisBar);
+            bool detectedSTBuySignal  = (buySignal  && lastDowntrendLow > 0 && wBosInArm && !wBosDetectedThisBar);
+
+            // Timeout detection
+            bool detectedTimeoutHigh = false;
+            bool detectedTimeoutLow  = false;
+            if(InpUseValidSwingTimeout && wTimeoutPending && !detectedSTSellSignal && !detectedSTBuySignal && !wBosDetectedThisBar)
+            {
+                if(wIsDowntrend && sellSignal && wLastPlacedSwingType != "HIGH" && wHighSinceLastValidLow > 0)
+                    detectedTimeoutHigh = true;
+                if(wIsUptrend && buySignal && wLastPlacedSwingType != "LOW" && wLowSinceLastValidHigh > 0)
+                    detectedTimeoutLow = true;
+            }
+
+            // ST SELL Signal → place H
+            if(detectedSTSellSignal)
+            {
+                wValidSH = lastUptrendHigh;
+                wValidSHTime = lastUptrendHighTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
+                    DrawSwingLabel("SH_" + IntegerToString((int)lastUptrendHighTime), barIdx, lastUptrendHigh, "H", clrRed, true);
+                }
+                wArm = wIsUptrend ? "PULLBACK_DOWN" : "MOVE_DOWN";
+                wBosInArm = false;
+                wLowSinceLastValidHigh = 0; wLowSinceLastValidHighTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "HIGH"; wLastPlacedSwingWasTimeout = false;
+            }
+
+            // ST BUY Signal → place L
+            if(detectedSTBuySignal)
+            {
+                wValidSL = lastDowntrendLow;
+                wValidSLTime = lastDowntrendLowTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
+                    DrawSwingLabel("SL_" + IntegerToString((int)lastDowntrendLowTime), barIdx, lastDowntrendLow, "L", clrGreen, false);
+                }
+                wArm = wIsDowntrend ? "PULLBACK_UP" : "MOVE_UP";
+                wBosInArm = false;
+                wHighSinceLastValidLow = 0; wHighSinceLastValidLowTime = 0;
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "LOW"; wLastPlacedSwingWasTimeout = false;
+            }
+
+            // Timeout HIGH
+            if(detectedTimeoutHigh)
+            {
+                wValidSH = wHighSinceLastValidLow;
+                wValidSHTime = wHighSinceLastValidLowTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                    DrawSwingLabel("SH_TO_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrDodgerBlue, true);
+                }
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "HIGH"; wLastPlacedSwingWasTimeout = true;
+                wBosInArm = false;
+                wPendingIntermedLow = l1; wPendingIntermedLowTime = tm[i];
+                wLowSinceLastValidHigh = l1; wLowSinceLastValidHighTime = tm[i];
+            }
+
+            // Timeout LOW
+            if(detectedTimeoutLow)
+            {
+                wValidSL = wLowSinceLastValidHigh;
+                wValidSLTime = wLowSinceLastValidHighTime;
+                if(InpShowSwingLabels)
+                {
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                    DrawSwingLabel("SL_TO_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrDodgerBlue, false);
+                }
+                wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
+                wLastPlacedSwingType = "LOW"; wLastPlacedSwingWasTimeout = true;
+                wBosInArm = false;
+                wPendingIntermedHigh = h1; wPendingIntermedHighTime = tm[i];
+                wHighSinceLastValidLow = h1; wHighSinceLastValidLowTime = tm[i];
+            }
+        }
+
+        prevUp = up;
+        prevDn = dn;
+    }
+
+    // === ST-State übertragen ===
+    trend = wTrend;
+    prevTrend = wTrend;
+    ArrayResize(upBuffer, 1); upBuffer[0] = prevUp;
+    ArrayResize(dnBuffer, 1); dnBuffer[0] = prevDn;
+
+    // === Arm/BOS/Swing-State übertragen ===
+    isUptrend   = wIsUptrend;
+    isDowntrend = wIsDowntrend;
+    currentArm  = wArm;
+    lastBOS     = wLastBOS;
+    bosOccurredInCurrentArm = wBosInArm;
+    validSH     = wValidSH;
+    validSHBar  = (wValidSHTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSHTime) : -1;
+    validSL     = wValidSL;
+    validSLBar  = (wValidSLTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSLTime) : -1;
+
+    // === Extreme tracking State übertragen ===
+    highSinceLastValidLow     = wHighSinceLastValidLow;
+    highSinceLastValidLowTime = wHighSinceLastValidLowTime;
+    lowSinceLastValidHigh     = wLowSinceLastValidHigh;
+    lowSinceLastValidHighTime = wLowSinceLastValidHighTime;
+    barsSinceLastValidSwing   = wBarsSinceLastValidSwing;
+    timeoutPending            = wTimeoutPending;
+    lastPlacedSwingType       = wLastPlacedSwingType;
+    lastPlacedSwingWasTimeout = wLastPlacedSwingWasTimeout;
+    pendingIntermedLow        = wPendingIntermedLow;
+    pendingIntermedLowTime    = wPendingIntermedLowTime;
+    pendingIntermedHigh       = wPendingIntermedHigh;
+    pendingIntermedHighTime   = wPendingIntermedHighTime;
+    bosDetectedThisBar        = false;
+
+    Print("CTF Warmup (", InpWarmupBars, " Bars): trend=", wTrend,
+          " isUp=", wIsUptrend, " arm=", wArm, " lastBOS=", wLastBOS,
+          " lastHigh=", lastUptrendHigh, " lastLow=", lastDowntrendLow,
+          " validSH=", wValidSH, " validSL=", wValidSL);
+}
+
+//+------------------------------------------------------------------+
+//| Warmup: HTF Supertrend aus historischen Bars kalibrieren         |
+//+------------------------------------------------------------------+
+void WarmupHTFSupertrend()
+{
+    if(!InpUseHTF) return;
+
+    int count = MathMin(InpWarmupBars + 3, iBars(_Symbol, InpHTFTimeframe));
+    if(count < 2) return;  // Absolutes Minimum: 2 Bars
+
+    double hi[], lo[], cl[], op[];
+    datetime tm[];
+    ArraySetAsSeries(hi, true);
+    ArraySetAsSeries(lo,  true); ArraySetAsSeries(cl, true);
+    ArraySetAsSeries(op,  true); ArraySetAsSeries(tm, true);
+
+    int gotHi = CopyHigh (_Symbol, InpHTFTimeframe, 0, count, hi);
+    int gotLo = CopyLow  (_Symbol, InpHTFTimeframe, 0, count, lo);
+    int gotCl = CopyClose(_Symbol, InpHTFTimeframe, 0, count, cl);
+    int gotOp = CopyOpen (_Symbol, InpHTFTimeframe, 0, count, op);
+    int gotTm = CopyTime (_Symbol, InpHTFTimeframe, 0, count, tm);
+
+    count = MathMin(gotHi, MathMin(gotLo, MathMin(gotCl, MathMin(gotOp, gotTm))));
+    if(count < 2) { Print("WarmupHTFSupertrend: Zu wenige HTF-Bars (", count, ")"); return; }
+
+    // Gemeinsame Zustandsvariablen für beide Pfade
+    double prevUp = 0, prevDn = 0;
+    int    wTrend = 1;
+    htfCurrentUptrendHigh = 0;  htfCurrentUptrendHighTime = 0;
+    htfCurrentDowntrendLow = 0; htfCurrentDowntrendLowTime = 0;
+    htfLastUptrendHigh = 0;     htfLastUptrendHighTime = 0;
+    htfLastDowntrendLow = 0;    htfLastDowntrendLowTime = 0;
+
+    double wSH = 0, wSL = DBL_MAX;
+    string wBOS = "NONE";
+
+    if(count >= InpSTperiod + 4)
+    {
+        // ========== VOLLER WARMUP mit Wilder ATR ==========
+        double atr[];
+        ArrayResize(atr, count);
+        ArraySetAsSeries(atr, true);
+
+        // Seed: Durchschnitt der ersten InpSTperiod True Ranges (älteste Bars)
+        double seedSum = 0;
+        for(int j = 0; j < InpSTperiod; j++)
+        {
+            int idx = count - 1 - j;
+            double tr = (idx + 1 < count)
+                        ? MathMax(hi[idx], cl[idx+1]) - MathMin(lo[idx], cl[idx+1])
+                        : hi[idx] - lo[idx];
+            seedSum += tr;
+        }
+        int seedIdx = count - InpSTperiod;
+        atr[seedIdx] = seedSum / InpSTperiod;
+
+        // Wilder Smoothing: alt→neu
+        for(int j = seedIdx - 1; j >= 0; j--)
+        {
+            double tr = MathMax(hi[j], cl[j+1]) - MathMin(lo[j], cl[j+1]);
+            atr[j] = (atr[j+1] * (InpSTperiod - 1) + tr) / InpSTperiod;
+        }
+        for(int j = seedIdx + 1; j < count; j++) atr[j] = hi[j] - lo[j];
+
+        // Swing-Initialisierung
+        int initWindow = MathMin(34, count);
+        for(int j = count - 1; j >= count - initWindow; j--)
+        { if(hi[j] > wSH) wSH = hi[j]; if(lo[j] < wSL) wSL = lo[j]; }
+
+        // Supertrend-Loop
+        for(int i = count - 1; i >= 2; i--)
+        {
+            double h1    = hi[i];
+            double l1    = lo[i];
+            double c1    = cl[i];
+            double o1    = op[i];
+            double cPrev = (i + 1 < count) ? cl[i + 1] : c1;
+
+            double src = (h1 + l1) / 2.0;
+            double up  = src - InpSTmultiplier * atr[i];
+            double dn  = src + InpSTmultiplier * atr[i];
+
+            if(prevUp > 0)
+            {
+                if(cPrev > prevUp) up = MathMax(up, prevUp);
+                if(cPrev < prevDn) dn = MathMin(dn, prevDn);
+            }
+
+            if(wTrend == 1  && (h1 > htfCurrentUptrendHigh || htfCurrentUptrendHigh == 0))
+                { htfCurrentUptrendHigh = h1;  htfCurrentUptrendHighTime = tm[i]; }
+            if(wTrend == -1 && (l1 < htfCurrentDowntrendLow || htfCurrentDowntrendLow == 0))
+                { htfCurrentDowntrendLow = l1; htfCurrentDowntrendLowTime = tm[i]; }
+
+            int prevTrendW = wTrend;
+            if(wTrend == -1 && c1 > prevDn)     wTrend = 1;
+            else if(wTrend == 1 && c1 < prevUp) wTrend = -1;
+
+            if(wTrend != prevTrendW)
+            {
+                if(wTrend == -1)
+                {
+                    htfLastUptrendHigh = htfCurrentUptrendHigh;
+                    htfLastUptrendHighTime = htfCurrentUptrendHighTime;
+                    htfCurrentDowntrendLow = l1; htfCurrentDowntrendLowTime = tm[i];
+                    if(htfLastUptrendHigh > 0)
+                    {
+                        wSH = htfLastUptrendHigh;
+                        if(InpShowSwingLabels)
+                        {
+                            int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
+                            DrawHTFSwingLabel("HTF_SH_" + IntegerToString((int)tm[i]), htfBarIdx, htfLastUptrendHigh, "HTF H", true);
+                        }
+                    }
+                }
+                else
+                {
+                    htfLastDowntrendLow = htfCurrentDowntrendLow;
+                    htfLastDowntrendLowTime = htfCurrentDowntrendLowTime;
+                    htfCurrentUptrendHigh = h1; htfCurrentUptrendHighTime = tm[i];
+                    if(htfLastDowntrendLow > 0)
+                    {
+                        wSL = htfLastDowntrendLow;
+                        if(InpShowSwingLabels)
+                        {
+                            int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
+                            DrawHTFSwingLabel("HTF_SL_" + IntegerToString((int)tm[i]), htfBarIdx, htfLastDowntrendLow, "HTF L", false);
+                        }
+                    }
+                }
+            }
+
+            double bodyHi = MathMax(c1, o1);
+            double bodyLo = MathMin(c1, o1);
+            if(wSH > 0 && bodyHi > wSH) wBOS = "UP";
+            if(wSL > 0 && bodyLo < wSL) wBOS = "DOWN";
+
+            prevUp = up;
+            prevDn = dn;
+        }
+
+        Print("HTF Warmup (", count, " Bars): trend=", wTrend == 1 ? "UP" : "DOWN",
+              " BOS=", wBOS, " SH=", wSH, " SL=", wSL == DBL_MAX ? 0 : wSL);
+    }
+    else
+    {
+        // ========== SCHNELL-INIT: Preisposition vs. grober ATR ==========
+        // Rohe ATR: Durchschnitt der True Ranges aus allen verfügbaren Bars
+        double roughATR = 0;
+        int atrSamples = count - 1;
+        for(int j = 0; j < atrSamples; j++)
+        {
+            double tr = MathMax(hi[j], cl[j+1]) - MathMin(lo[j], cl[j+1]);
+            roughATR += tr;
+        }
+        roughATR = (atrSamples > 0) ? roughATR / atrSamples : (hi[0] - lo[0]);
+
+        double src    = (hi[0] + lo[0]) / 2.0;
+        double upBand = src - InpSTmultiplier * roughATR;
+        double dnBand = src + InpSTmultiplier * roughATR;
+
+        // Trend: upBand (Support) ist unterm Preis → Aufwärtstrend
+        //        dnBand (Resistance) ist überm Preis → Abwärtstrend
+        wTrend = (cl[0] >= upBand) ? 1 : -1;
+        prevUp = upBand;
+        prevDn = dnBand;
+
+        // Swing-Struktur aus verfügbaren Bars
+        for(int j = 0; j < count; j++)
+        { if(hi[j] > wSH) wSH = hi[j]; if(lo[j] < wSL) wSL = lo[j]; }
+
+        if(wTrend == 1) { htfCurrentUptrendHigh = hi[0]; htfCurrentUptrendHighTime = tm[0]; }
+        else            { htfCurrentDowntrendLow = lo[0]; htfCurrentDowntrendLowTime = tm[0]; }
+
+        Print("HTF Schnell-Init (", count, " Bars): trend=", wTrend == 1 ? "UP" : "DOWN",
+              " close=", cl[0], " upBand=", upBand, " dnBand=", dnBand);
+    }
+
+    // ========== Gemeinsamer Abschluss ==========
+    htfTrend = wTrend;
+    htfPrevTrend = wTrend;
+    ArrayResize(htfUpBuffer, 1); htfUpBuffer[0] = prevUp;
+    ArrayResize(htfDnBuffer, 1); htfDnBuffer[0] = prevDn;
+    htfValidSH = wSH;
+    htfValidSL = (wSL == DBL_MAX) ? 0 : wSL;
+    htfLastBOS = wBOS;
+    htfInitialized = true;
+    lastHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Swing Structure                                       |
+//+------------------------------------------------------------------+
+void InitializeSwingStructure()
+{
+    int bars = Bars(_Symbol, PERIOD_CURRENT);
+    if(bars < 34) return;
+
+    WarmupCTFSupertrend();
+
+    // Kein Warmup → State manuell initialisieren
+    if(InpWarmupBars <= 0)
+    {
+        int highestBar = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, 34, 1);
+        int lowestBar = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, 34, 1);
+
+        validSH = iHigh(_Symbol, PERIOD_CURRENT, highestBar);
+        validSL = iLow(_Symbol, PERIOD_CURRENT, lowestBar);
+        validSHBar = highestBar;
+        validSLBar = lowestBar;
+
+        double currentHigh2 = iHigh(_Symbol, PERIOD_CURRENT, 1);
+        double prevHigh2 = iHigh(_Symbol, PERIOD_CURRENT, 2);
+        isUptrend = currentHigh2 > prevHigh2;
+        isDowntrend = !isUptrend;
+
+        lastBOS = isUptrend ? "UP" : "DOWN";
+        currentArm = isUptrend ? "MOVE_UP" : "MOVE_DOWN";
+        bosOccurredInCurrentArm = true;
+
+        // Initialize valid swing tracking variables
+        highSinceLastValidLow = 0;
+        highSinceLastValidLowTime = 0;
+        lowSinceLastValidHigh = 0;
+        lowSinceLastValidHighTime = 0;
+        barsSinceLastValidSwing = 0;
+        timeoutPending = false;
+        lastPlacedSwingType = "NONE";
+        lastPlacedSwingWasTimeout = false;
+        bosDetectedThisBar = false;
+        pendingIntermedLow = 0;
+        pendingIntermedLowTime = 0;
+        pendingIntermedHigh = 0;
+        pendingIntermedHighTime = 0;
+
+        // Draw initial swing labels in WHITE
+        if(InpShowSwingLabels)
+        {
+            DrawSwingLabel("SH_" + IntegerToString(TimeCurrent()), validSHBar, validSH, "H", clrWhite, true);
+            DrawSwingLabel("SL_" + IntegerToString(TimeCurrent()), validSLBar, validSL, "L", clrWhite, false);
+        }
+    }
+    // Mit Warmup: isUptrend, isDowntrend, currentArm, lastBOS, bosOccurredInCurrentArm,
+    //             validSH/SL/Bar, extreme tracking, timeout state — alles von WarmupCTFSupertrend gesetzt.
+
+    initialized = true;
+
+    // Bar[1] verarbeiten (Warmup endet bei Bar[2])
+    CalculateSupertrend();
+
+    // HTF initialisieren – Warmup erledigt das bereits wenn InpWarmupBars > 0
+    if(!htfInitialized)
+        InitializeHTFSwingStructure();
+
+    // Alles sofort zeichnen – nicht auf nächste Bar warten
+    DrawSupertrendLines();
+    DrawEMALines();
+
+    // Bar[1] ST-Flip: UpdateSwingStructure + UpdateSupertrendCandidates aufrufen
+    if(trend != prevTrend)
+    {
+        UpdateSwingStructure();
+        UpdateSupertrendCandidates();
+    }
+
+    Print("Swing Structure initialized: SH=", validSH, " SL=", validSL,
+          " trend=", (isUptrend ? "UP" : "DOWN"),
+          " arm=", currentArm, " lastBOS=", lastBOS,
+          " warmup=", (InpWarmupBars > 0 ? "ON" : "OFF"));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Supertrend                                             |
+//+------------------------------------------------------------------+
+void CalculateSupertrend()
+{
+    double atr[];
+    ArraySetAsSeries(atr, true);
+
+    if(CopyBuffer(atrHandle, 0, 0, 3, atr) < 3)
+        return;
+
+    double high1 = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double low1 = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+    double close2 = iClose(_Symbol, PERIOD_CURRENT, 2);
+
+    double src = (high1 + low1) / 2.0;
+    double up = src - (InpSTmultiplier * atr[1]);
+    double dn = src + (InpSTmultiplier * atr[1]);
+
+    double prevUp = 0;
+    double prevDn = 0;
+
+    if(ArraySize(upBuffer) > 0)
+    {
+        prevUp = upBuffer[0];
+        prevDn = dnBuffer[0];
+    }
+    else
+    {
+        prevUp = up;
+        prevDn = dn;
+    }
+
+    if(close2 > prevUp)
+        up = MathMax(up, prevUp);
+    if(close2 < prevDn)
+        dn = MathMin(dn, prevDn);
+
+    ArrayResize(upBuffer, ArraySize(upBuffer) + 1);
+    ArrayResize(dnBuffer, ArraySize(dnBuffer) + 1);
+
+    for(int i = ArraySize(upBuffer) - 1; i > 0; i--)
+    {
+        upBuffer[i] = upBuffer[i - 1];
+        dnBuffer[i] = dnBuffer[i - 1];
+    }
+
+    upBuffer[0] = up;
+    dnBuffer[0] = dn;
+
+    // Cap buffer size to prevent unbounded memory growth (only [0] is used)
+    if(ArraySize(upBuffer) > 4)
+    {
+        ArrayResize(upBuffer, 4);
+        ArrayResize(dnBuffer, 4);
+    }
+
+    // === STEP 1: EXTREMPUNKTE TRACKING MIT ALTEM TREND (VOR Trend-Bestimmung!) ===
+    // Erfasst bar[1]'s High/Low fuer den ausgehenden Trend
+    // Matching Pine: stTrackedHigh/stTrackedLow wird VOR trendChanged aktualisiert
+    if(trend == 1)
+    {
+        if(high1 > currentUptrendHigh || currentUptrendHigh == 0)
+        {
+            currentUptrendHigh = high1;
+            currentUptrendHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+    }
+    if(trend == -1)
+    {
+        if(low1 < currentDowntrendLow || currentDowntrendLow == 0)
+        {
+            currentDowntrendLow = low1;
+            currentDowntrendLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+    }
+
+    // === STEP 2: TREND BESTIMMEN ===
+    prevTrend = trend;
+    if(trend == -1 && close1 > prevDn)
+        trend = 1;
+    else if(trend == 1 && close1 < prevUp)
+        trend = -1;
+
+    // === EMA TOUCH TRACKING (nutzt NEUEN Trend) ===
+    // Guard: EMA-Handle kann auf anderem TF sein und noch nicht bereit
+    double emaSlowValue[];
+    ArraySetAsSeries(emaSlowValue, true);
+    if(BarsCalculated(emaSlowHandle) >= 1 && CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowValue) > 0)
+    {
+        // UPTREND: Warte auf Retracement (ST Down) und prüfe ob Preis UNTER EMA war
+        if(trend == -1 && isUptrend && low1 < emaSlowValue[0])
+            priceWasBelowSlowEMA = true;
+
+        // DOWNTREND: Warte auf Retracement (ST Up) und prüfe ob Preis ÜBER EMA war
+        if(trend == 1 && isDowntrend && high1 > emaSlowValue[0])
+            priceWasAboveSlowEMA = true;
+    }
+
+    // === STEP 3: BEI TRENDWECHSEL: SPEICHERE EXTREMPUNKTE & INITIALISIERE NEUES TRACKING ===
+    bool trendChanged = (trend != prevTrend);
+    if(trendChanged && prevTrend != 0)
+    {
+        if(trend == -1)  // Wechsel zu DOWNTREND -> Speichere letztes UPTREND HIGH
+        {
+            lastUptrendHigh = currentUptrendHigh;
+            lastUptrendHighTime = currentUptrendHighTime;
+
+            Print("ST Wechsel zu DOWN: HIGH = ", lastUptrendHigh, " bei Zeit ", TimeToString(lastUptrendHighTime));
+
+            // Initialisiere neues Downtrend-Tracking mit aktuellem Bar
+            currentDowntrendLow = low1;
+            currentDowntrendLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+        else if(trend == 1)  // Wechsel zu UPTREND -> Speichere letztes DOWNTREND LOW
+        {
+            lastDowntrendLow = currentDowntrendLow;
+            lastDowntrendLowTime = currentDowntrendLowTime;
+
+            Print("ST Wechsel zu UP: LOW = ", lastDowntrendLow, " bei Zeit ", TimeToString(lastDowntrendLowTime));
+
+            // Initialisiere neues Uptrend-Tracking mit aktuellem Bar
+            currentUptrendHigh = high1;
+            currentUptrendHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+    }
+    // Kein separater Tracking-Block noetig — Step 1 trackt laufend mit altem Trend
+}
+
+//+------------------------------------------------------------------+
+//| Draw Supertrend Lines on Chart - ONE LINE above or below price  |
+//+------------------------------------------------------------------+
+void DrawSupertrendLines()
+{
+    if(!InpShowSupertrendLines) return;
+
+    int bars = Bars(_Symbol, PERIOD_CURRENT);
+    int maxBars = MathMin(bars, 500);
+
+    // Delete old supertrend objects
+    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(0, i);
+        if(StringFind(objName, stLinePrefix) >= 0)
+            ObjectDelete(0, objName);
+    }
+
+    // Recalculate Supertrend for all bars
+    double atr[];
+    double high_arr[], low_arr[], close_arr[];
+    ArraySetAsSeries(atr, true);
+    ArraySetAsSeries(high_arr, true);
+    ArraySetAsSeries(low_arr, true);
+    ArraySetAsSeries(close_arr, true);
+
+    if(CopyBuffer(atrHandle, 0, 0, maxBars, atr) < maxBars) return;
+    if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, maxBars, high_arr) < maxBars) return;
+    if(CopyLow(_Symbol, PERIOD_CURRENT, 0, maxBars, low_arr) < maxBars) return;
+    if(CopyClose(_Symbol, PERIOD_CURRENT, 0, maxBars, close_arr) < maxBars) return;
+
+    double up_arr[], dn_arr[];
+    ArrayResize(up_arr, maxBars);
+    ArrayResize(dn_arr, maxBars);
+    int trend_arr[];
+    ArrayResize(trend_arr, maxBars);
+
+    // Calculate Supertrend values
+    for(int i = maxBars - 1; i >= 0; i--)
+    {
+        double src = (high_arr[i] + low_arr[i]) / 2.0;
+        double up = src - (InpSTmultiplier * atr[i]);
+        double dn = src + (InpSTmultiplier * atr[i]);
+
+        if(i < maxBars - 1)
+        {
+            double prevUp = up_arr[i + 1];
+            double prevDn = dn_arr[i + 1];
+            double prevClose = close_arr[i + 1];
+
+            if(prevClose > prevUp)
+                up = MathMax(up, prevUp);
+
+            if(prevClose < prevDn)
+                dn = MathMin(dn, prevDn);
+
+            int localPrevTrend = trend_arr[i + 1];
+            int currentTrend = localPrevTrend;
+
+            if(localPrevTrend == -1 && close_arr[i] > prevDn)
+                currentTrend = 1;
+            else if(localPrevTrend == 1 && close_arr[i] < prevUp)
+                currentTrend = -1;
+
+            trend_arr[i] = currentTrend;
+        }
+        else
+        {
+            trend_arr[i] = 1;
+        }
+
+        up_arr[i] = up;
+        dn_arr[i] = dn;
+    }
+
+    // Draw Supertrend as trend line segments
+    // Green when below price (uptrend), Red when above price (downtrend)
+    for(int i = maxBars - 2; i >= 0; i--)
+    {
+        datetime time1 = iTime(_Symbol, PERIOD_CURRENT, i + 1);
+        datetime time2 = iTime(_Symbol, PERIOD_CURRENT, i);
+
+        double price1, price2;
+        color lineColor;
+
+        if(trend_arr[i + 1] == 1) // Uptrend - green line below price
+        {
+            price1 = up_arr[i + 1];
+            price2 = up_arr[i];
+            lineColor = clrLime;
+        }
+        else // Downtrend - red line above price
+        {
+            price1 = dn_arr[i + 1];
+            price2 = dn_arr[i];
+            lineColor = clrRed;
+        }
+
+        // Check if trend changed
+        if(i < maxBars - 2 && trend_arr[i] != trend_arr[i + 1])
+        {
+            // Trend changed - draw to current point
+            string objName = stLinePrefix + IntegerToString(i) + "_change";
+            if(ObjectCreate(0, objName, OBJ_TREND, 0, time1, price1, time2, price2))
+            {
+                ObjectSetInteger(0, objName, OBJPROP_COLOR, lineColor);
+                ObjectSetInteger(0, objName, OBJPROP_WIDTH, InpSupertrendWidth);
+                ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+                ObjectSetInteger(0, objName, OBJPROP_BACK, false);
+            }
+        }
+        else if(trend_arr[i] == trend_arr[i + 1])
+        {
+            // Same trend - continue line
+            string objName = stLinePrefix + IntegerToString(i);
+            if(ObjectCreate(0, objName, OBJ_TREND, 0, time1, price1, time2, price2))
+            {
+                ObjectSetInteger(0, objName, OBJPROP_COLOR, lineColor);
+                ObjectSetInteger(0, objName, OBJPROP_WIDTH, InpSupertrendWidth);
+                ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+                ObjectSetInteger(0, objName, OBJPROP_BACK, false);
+            }
+        }
+    }
+
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Draw EMA Lines on Chart                                          |
+//+------------------------------------------------------------------+
+void DrawEMALines()
+{
+    if(!InpShowEMALines) return;
+
+    // Bars direkt vom gewählten TF holen — kein Handle, kein BarsCalculated-Problem
+    int totalBars = iBars(_Symbol, InpEMATimeframe);
+    if(totalBars < 2) return;
+
+    // Warmup: damit EMA am Anfang nicht falsch startet, nehmen wir extra Bars zum Seeden
+    int warmup  = MathMax(InpEMASlow * 3, 50);
+    int maxDraw = MathMin(500, totalBars - 1);           // so viele Bars zeichnen
+    int copyN   = MathMin(maxDraw + warmup, totalBars);  // inkl. Warmup kopieren
+
+    double cl[];
+    datetime tm[];
+    ArraySetAsSeries(cl, true);
+    ArraySetAsSeries(tm, true);
+
+    if(CopyClose(_Symbol, InpEMATimeframe, 0, copyN, cl) < copyN) return;
+    if(CopyTime (_Symbol, InpEMATimeframe, 0, copyN, tm) < copyN) return;
+
+    // EMA manuell berechnen (alt→neu, Index copyN-1 ist ältester Bar)
+    double alphaFast = 2.0 / (InpEMAFast + 1);
+    double alphaSlow = 2.0 / (InpEMASlow + 1);
+
+    double emaFast[], emaSlow[];
+    ArrayResize(emaFast, copyN);
+    ArrayResize(emaSlow, copyN);
+    ArraySetAsSeries(emaFast, true);
+    ArraySetAsSeries(emaSlow, true);
+
+    // Seed: letzter (ältester) Bar
+    emaFast[copyN - 1] = cl[copyN - 1];
+    emaSlow[copyN - 1] = cl[copyN - 1];
+
+    // Von alt nach neu durchlaufen (hoher Index = alt in AsSeries)
+    for(int i = copyN - 2; i >= 0; i--)
+    {
+        emaFast[i] = emaFast[i + 1] + alphaFast * (cl[i] - emaFast[i + 1]);
+        emaSlow[i] = emaSlow[i + 1] + alphaSlow * (cl[i] - emaSlow[i + 1]);
+    }
+
+    // Alte EMA-Objekte löschen
+    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+    {
+        string n = ObjectName(0, i);
+        if(StringFind(n, "DTFX_EMA_Fast_") == 0 || StringFind(n, "DTFX_EMA_Slow_") == 0)
+            ObjectDelete(0, n);
+    }
+
+    // Nur die vorderen maxDraw Bars zeichnen (Warmup-Bars nicht plotten)
+    for(int i = maxDraw - 1; i >= 0; i--)
+    {
+        datetime t1 = tm[i + 1];
+        datetime t2 = tm[i];
+        if(t1 == 0 || t2 == 0) continue;
+
+        string nF = "DTFX_EMA_Fast_" + IntegerToString(i);
+        if(ObjectCreate(0, nF, OBJ_TREND, 0, t1, emaFast[i + 1], t2, emaFast[i]))
+        {
+            ObjectSetInteger(0, nF, OBJPROP_COLOR,     InpEMAFastColor);
+            ObjectSetInteger(0, nF, OBJPROP_WIDTH,     InpEMAWidth);
+            ObjectSetInteger(0, nF, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, nF, OBJPROP_BACK,      true);
+        }
+
+        string nS = "DTFX_EMA_Slow_" + IntegerToString(i);
+        if(ObjectCreate(0, nS, OBJ_TREND, 0, t1, emaSlow[i + 1], t2, emaSlow[i]))
+        {
+            ObjectSetInteger(0, nS, OBJPROP_COLOR,     InpEMASlowColor);
+            ObjectSetInteger(0, nS, OBJPROP_WIDTH,     InpEMAWidth);
+            ObjectSetInteger(0, nS, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, nS, OBJPROP_BACK,      true);
+        }
+    }
+
+    ChartRedraw();
+}
+
+
+//+------------------------------------------------------------------+
+//| Update Swing Structure (BOS-gated, matching Pine logic)         |
+//+------------------------------------------------------------------+
+void UpdateSwingStructure()
+{
+    barsSinceLastValidSwing++;
+    bosDetectedThisBar = false;  // Reset at start of each bar
+
+    // Timeout check
+    if(InpUseValidSwingTimeout && barsSinceLastValidSwing >= InpValidSwingTimeoutBars)
+    {
+        if(!timeoutPending)
+            Print("TIMEOUT PENDING: barsSinceLastValidSwing=", barsSinceLastValidSwing, " >= ", InpValidSwingTimeoutBars, " | isUptrend=", isUptrend, " isDowntrend=", isDowntrend, " lastPlacedSwingType=", lastPlacedSwingType);
+        timeoutPending = true;
+    }
+
+    double currentHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double currentLow = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double currentClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+    double currentOpen = iOpen(_Symbol, PERIOD_CURRENT, 1);
+    datetime currentTime1 = iTime(_Symbol, PERIOD_CURRENT, 1);
+
+    double bodyHigh = MathMax(currentClose, currentOpen);
+    double bodyLow = MathMin(currentClose, currentOpen);
+
+    // === EXTREME TRACKING (between validated swings) ===
+    // Track highest point since last valid LOW (for HIGH placement at BOS DOWN)
+    if(highSinceLastValidLow == 0 || currentHigh > highSinceLastValidLow)
+    {
+        highSinceLastValidLow = currentHigh;
+        highSinceLastValidLowTime = currentTime1;
+    }
+    // Track lowest point since last valid HIGH (for LOW placement at BOS UP)
+    if(lowSinceLastValidHigh == 0 || currentLow < lowSinceLastValidHigh)
+    {
+        lowSinceLastValidHigh = currentLow;
+        lowSinceLastValidHighTime = currentTime1;
+    }
+
+    // === PENDING INTERMEDIATE TRACKING (only active after timeout swing) ===
+    if(lastPlacedSwingWasTimeout && lastPlacedSwingType == "HIGH")
+    {
+        // After timeout HIGH: track lowest candle (for intermediate LOW at BOS UP)
+        if(pendingIntermedLow == 0 || currentLow < pendingIntermedLow)
+        {
+            pendingIntermedLow = currentLow;
+            pendingIntermedLowTime = currentTime1;
+        }
+    }
+    if(lastPlacedSwingWasTimeout && lastPlacedSwingType == "LOW")
+    {
+        // After timeout LOW: track highest candle (for intermediate HIGH at BOS DOWN)
+        if(pendingIntermedHigh == 0 || currentHigh > pendingIntermedHigh)
+        {
+            pendingIntermedHigh = currentHigh;
+            pendingIntermedHighTime = currentTime1;
+        }
+    }
+
+    // EMA Touch Tracking - Mutual Exclusion Guard
+    if(priceWasBelowSlowEMA && priceWasAboveSlowEMA)
+    {
+        priceWasBelowSlowEMA = false;
+        priceWasAboveSlowEMA = false;
+    }
+
+    // === BOS DETECTION (gated by trend direction, matching Pine) ===
+    // BOS UP: body breaks above validSH, only when ST trend == 1 (green)
+    bool detectedBOSUp = false;
+    if(validSH > 0 && bodyHigh > validSH && !bosOccurredInCurrentArm && trend == 1)
+        detectedBOSUp = true;
+
+    // BOS DOWN: body breaks below validSL, only when ST trend == -1 (red)
+    bool detectedBOSDown = false;
+    if(validSL > 0 && bodyLow < validSL && !bosOccurredInCurrentArm && trend == -1)
+        detectedBOSDown = true;
+
+    // === BOS UP ACTIONS (matching Pine: intermediate swing placement) ===
+    if(detectedBOSUp)
+    {
+        bool wasAlreadyUptrend = isUptrend;
+        bosOccurredInCurrentArm = true;
+        bosDetectedThisBar = true;
+        lastBOS = "UP";
+        isUptrend = true;
+        isDowntrend = false;
+
+        // TREND CONTINUATION (was already uptrend): place LOW immediately
+        if(wasAlreadyUptrend && lowSinceLastValidHigh > 0)
+        {
+            if(!lastPlacedSwingWasTimeout)
+            {
+                // If last placed swing was also a LOW, place intermediate HIGH first
+                if(lastPlacedSwingType == "LOW" && highSinceLastValidLow > 0)
+                {
+                    validSH = highSinceLastValidLow;
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+                    validSHBar = barIdx;
+                    if(InpShowSwingLabels)
+                        DrawSwingLabel("SH_" + IntegerToString((int)highSinceLastValidLowTime), barIdx, validSH, "H", clrRed, true);
+                }
+                // Place LOW at lowest point since last valid HIGH
+                validSL = lowSinceLastValidHigh;
+                int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+                validSLBar = barIdx;
+                if(InpShowSwingLabels)
+                    DrawSwingLabel("SL_" + IntegerToString((int)lowSinceLastValidHighTime), barIdx, validSL, "L", clrGreen, false);
+            }
+            // Reset trackers
+            highSinceLastValidLow = 0;
+            highSinceLastValidLowTime = 0;
+            pendingIntermedHigh = 0;
+            pendingIntermedHighTime = 0;
+            barsSinceLastValidSwing = 0;
+            timeoutPending = false;
+            lastPlacedSwingType = "LOW";
+            lastPlacedSwingWasTimeout = false;
+        }
+        // TREND CHANGE (was downtrend, timeout HIGH active): place intermediate LOW
+        else if(!wasAlreadyUptrend && lastPlacedSwingWasTimeout && lastPlacedSwingType == "HIGH" && pendingIntermedLow > 0)
+        {
+            validSL = pendingIntermedLow;
+            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, pendingIntermedLowTime);
+            validSLBar = barIdx;
+            if(InpShowSwingLabels)
+                DrawSwingLabel("SL_" + IntegerToString((int)pendingIntermedLowTime), barIdx, validSL, "L", clrGreen, false);
+            highSinceLastValidLow = 0;
+            highSinceLastValidLowTime = 0;
+            pendingIntermedLow = 0;
+            pendingIntermedLowTime = 0;
+            barsSinceLastValidSwing = 0;
+            timeoutPending = false;
+            lastPlacedSwingType = "LOW";
+            lastPlacedSwingWasTimeout = false;
+        }
+        // TREND CHANGE (was downtrend, no timeout): L already from downtrend, no new swing
+        else if(!wasAlreadyUptrend)
+        {
+            lastPlacedSwingWasTimeout = false;
+        }
+    }
+
+    // === BOS DOWN ACTIONS (matching Pine: intermediate swing placement) ===
+    if(detectedBOSDown)
+    {
+        bool wasAlreadyDowntrend = isDowntrend;
+        bosOccurredInCurrentArm = true;
+        bosDetectedThisBar = true;
+        lastBOS = "DOWN";
+        isUptrend = false;
+        isDowntrend = true;
+
+        // TREND CONTINUATION (was already downtrend): place HIGH immediately
+        if(wasAlreadyDowntrend && highSinceLastValidLow > 0)
+        {
+            if(!lastPlacedSwingWasTimeout)
+            {
+                // If last placed swing was also a HIGH, place intermediate LOW first
+                if(lastPlacedSwingType == "HIGH" && lowSinceLastValidHigh > 0)
+                {
+                    validSL = lowSinceLastValidHigh;
+                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+                    validSLBar = barIdx;
+                    if(InpShowSwingLabels)
+                        DrawSwingLabel("SL_" + IntegerToString((int)lowSinceLastValidHighTime), barIdx, validSL, "L", clrGreen, false);
+                }
+                // Place HIGH at highest point since last valid LOW
+                validSH = highSinceLastValidLow;
+                int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+                validSHBar = barIdx;
+                if(InpShowSwingLabels)
+                    DrawSwingLabel("SH_" + IntegerToString((int)highSinceLastValidLowTime), barIdx, validSH, "H", clrRed, true);
+            }
+            // Reset trackers
+            lowSinceLastValidHigh = 0;
+            lowSinceLastValidHighTime = 0;
+            pendingIntermedLow = 0;
+            pendingIntermedLowTime = 0;
+            barsSinceLastValidSwing = 0;
+            timeoutPending = false;
+            lastPlacedSwingType = "HIGH";
+            lastPlacedSwingWasTimeout = false;
+        }
+        // TREND CHANGE (was uptrend, timeout LOW active): place intermediate HIGH
+        else if(!wasAlreadyDowntrend && lastPlacedSwingWasTimeout && lastPlacedSwingType == "LOW" && pendingIntermedHigh > 0)
+        {
+            validSH = pendingIntermedHigh;
+            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, pendingIntermedHighTime);
+            validSHBar = barIdx;
+            if(InpShowSwingLabels)
+                DrawSwingLabel("SH_" + IntegerToString((int)pendingIntermedHighTime), barIdx, validSH, "H", clrRed, true);
+            lowSinceLastValidHigh = 0;
+            lowSinceLastValidHighTime = 0;
+            pendingIntermedHigh = 0;
+            pendingIntermedHighTime = 0;
+            barsSinceLastValidSwing = 0;
+            timeoutPending = false;
+            lastPlacedSwingType = "HIGH";
+            lastPlacedSwingWasTimeout = false;
+        }
+        // TREND CHANGE (was uptrend, no timeout): H already from uptrend, no new swing
+        else if(!wasAlreadyDowntrend)
+        {
+            lastPlacedSwingWasTimeout = false;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update Supertrend Candidates (BOS-gated, matching Pine logic)   |
+//+------------------------------------------------------------------+
+void UpdateSupertrendCandidates()
+{
+    // CalculateSupertrend() is now called from OnTick before UpdateSwingStructure()
+
+    bool buySignal = (trend == 1 && prevTrend == -1);
+    bool sellSignal = (trend == -1 && prevTrend == 1);
+
+    // === EMA STATUS CAPTURE (always at ST change, before any resets) ===
+    if(sellSignal)
+        emaConditionMetAtSTChangeShort = priceWasAboveSlowEMA;
+    if(buySignal)
+        emaConditionMetAtSTChange = priceWasBelowSlowEMA;
+
+    // === ST SIGNAL DETECTION (gated by BOS, matching Pine) ===
+    // IMPORTANT: !bosDetectedThisBar ensures ST signal and BOS are mutually exclusive per bar (Pine behavior)
+    bool detectedSTSellSignal = (sellSignal && lastUptrendHigh > 0 && bosOccurredInCurrentArm && !bosDetectedThisBar);
+    bool detectedSTBuySignal = (buySignal && lastDowntrendLow > 0 && bosOccurredInCurrentArm && !bosDetectedThisBar);
+
+    // === TIMEOUT DETECTION (only at ST change, no BOS/ST signal) ===
+    bool detectedTimeoutHigh = false;
+    bool detectedTimeoutLow = false;
+    if(InpUseValidSwingTimeout && timeoutPending && !detectedSTSellSignal && !detectedSTBuySignal && !bosDetectedThisBar)
+    {
+        // Downtrend: place timeout HIGH at sellSignal
+        if(isDowntrend && sellSignal && lastPlacedSwingType != "HIGH" && highSinceLastValidLow > 0)
+            detectedTimeoutHigh = true;
+        // Uptrend: place timeout LOW at buySignal
+        if(isUptrend && buySignal && lastPlacedSwingType != "LOW" && lowSinceLastValidHigh > 0)
+            detectedTimeoutLow = true;
+    }
+
+    // === ST SELL SIGNAL ACTION (BOS occurred -> place H) ===
+    if(detectedSTSellSignal)
+    {
+        validSH = lastUptrendHigh;
+        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
+        validSHBar = barIndex;
+
+        if(InpShowSwingLabels)
+            DrawSwingLabel("SH_" + IntegerToString(TimeCurrent()), barIndex, lastUptrendHigh, "H", clrRed, true);
+
+        if(isUptrend)
+        {
+            currentArm = "PULLBACK_DOWN";
+            swingLongUsed = false;  // Neuer Pullback-Arm: Long-Trade-Flag zurücksetzen
+        }
+        else
+            currentArm = "MOVE_DOWN";
+
+        bosOccurredInCurrentArm = false;
+        // Reset LOW tracker (new HIGH placed -> track next LOW)
+        lowSinceLastValidHigh = 0;
+        lowSinceLastValidHighTime = 0;
+        barsSinceLastValidSwing = 0;
+        timeoutPending = false;
+        lastPlacedSwingType = "HIGH";
+        lastPlacedSwingWasTimeout = false;
+
+        Print("ST SELL Signal (BOS-gated): H bei Bar ", barIndex, " Preis ", lastUptrendHigh);
+    }
+
+    // === ST BUY SIGNAL ACTION (BOS occurred -> place L) ===
+    if(detectedSTBuySignal)
+    {
+        validSL = lastDowntrendLow;
+        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
+        validSLBar = barIndex;
+
+        if(InpShowSwingLabels)
+            DrawSwingLabel("SL_" + IntegerToString(TimeCurrent()), barIndex, lastDowntrendLow, "L", clrGreen, false);
+
+        if(isDowntrend)
+        {
+            currentArm = "PULLBACK_UP";
+            swingShortUsed = false;  // Neuer Pullback-Arm: Short-Trade-Flag zurücksetzen
+        }
+        else
+            currentArm = "MOVE_UP";
+
+        bosOccurredInCurrentArm = false;
+        // Reset HIGH tracker (new LOW placed -> track next HIGH)
+        highSinceLastValidLow = 0;
+        highSinceLastValidLowTime = 0;
+        barsSinceLastValidSwing = 0;
+        timeoutPending = false;
+        lastPlacedSwingType = "LOW";
+        lastPlacedSwingWasTimeout = false;
+
+        Print("ST BUY Signal (BOS-gated): L bei Bar ", barIndex, " Preis ", lastDowntrendLow);
+    }
+
+    // === TIMEOUT HIGH ACTION ===
+    if(detectedTimeoutHigh)
+    {
+        validSH = highSinceLastValidLow;
+        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+        validSHBar = barIndex;
+
+        if(InpShowSwingLabels)
+            DrawSwingLabel("SH_TO_" + IntegerToString(TimeCurrent()), barIndex, validSH, "H", clrDodgerBlue, true);
+
+        barsSinceLastValidSwing = 0;
+        timeoutPending = false;
+        lastPlacedSwingType = "HIGH";
+        lastPlacedSwingWasTimeout = true;
+        bosOccurredInCurrentArm = false;
+
+        // Scan bars from timeout H bar to current for initial pendingIntermedLow
+        pendingIntermedLow = iLow(_Symbol, PERIOD_CURRENT, 1);
+        pendingIntermedLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        for(int i = 1; i <= barIndex; i++)
+        {
+            double lo = iLow(_Symbol, PERIOD_CURRENT, i);
+            if(lo < pendingIntermedLow)
+            {
+                pendingIntermedLow = lo;
+                pendingIntermedLowTime = iTime(_Symbol, PERIOD_CURRENT, i);
+            }
+        }
+        // Initialize the low tracker
+        lowSinceLastValidHigh = pendingIntermedLow;
+        lowSinceLastValidHighTime = pendingIntermedLowTime;
+
+        Print("TIMEOUT HIGH: H bei Bar ", barIndex, " Preis ", validSH);
+    }
+
+    // === TIMEOUT LOW ACTION ===
+    if(detectedTimeoutLow)
+    {
+        validSL = lowSinceLastValidHigh;
+        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+        validSLBar = barIndex;
+
+        if(InpShowSwingLabels)
+            DrawSwingLabel("SL_TO_" + IntegerToString(TimeCurrent()), barIndex, validSL, "L", clrDodgerBlue, false);
+
+        barsSinceLastValidSwing = 0;
+        timeoutPending = false;
+        lastPlacedSwingType = "LOW";
+        lastPlacedSwingWasTimeout = true;
+        bosOccurredInCurrentArm = false;
+
+        // Scan bars from timeout L bar to current for initial pendingIntermedHigh
+        pendingIntermedHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+        pendingIntermedHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        for(int i = 1; i <= barIndex; i++)
+        {
+            double hi = iHigh(_Symbol, PERIOD_CURRENT, i);
+            if(hi > pendingIntermedHigh)
+            {
+                pendingIntermedHigh = hi;
+                pendingIntermedHighTime = iTime(_Symbol, PERIOD_CURRENT, i);
+            }
+        }
+        // Initialize the high tracker
+        highSinceLastValidLow = pendingIntermedHigh;
+        highSinceLastValidLowTime = pendingIntermedHighTime;
+
+        Print("TIMEOUT LOW: L bei Bar ", barIndex, " Preis ", validSL);
+    }
+
+    // === EMA Touch Flags RESET at ST change ===
+    if(sellSignal || buySignal)
+    {
+        priceWasBelowSlowEMA = false;
+        priceWasAboveSlowEMA = false;
+    }
+
+}
+
+//+------------------------------------------------------------------+
+//| Check if hour falls within a session range (handles midnight)   |
+//+------------------------------------------------------------------+
+bool IsHourInSession(int hour, int startHour, int endHour)
+{
+    if(startHour <= endHour)
+        return (hour >= startHour && hour < endHour);
+    else // crosses midnight (e.g. Asia 21-06)
+        return (hour >= startHour || hour < endHour);
+}
+
+bool IsHourBlocked(int hour)
+{
+    if(InpBlockHour1 >= 0 && hour == InpBlockHour1) return true;
+    if(InpBlockHour2 >= 0 && hour == InpBlockHour2) return true;
+    if(InpBlockHour3 >= 0 && hour == InpBlockHour3) return true;
+    if(InpBlockHour4 >= 0 && hour == InpBlockHour4) return true;
+    if(InpBlockHour5 >= 0 && hour == InpBlockHour5) return true;
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current UTC time is within an active session           |
+//+------------------------------------------------------------------+
+bool IsInSession()
+{
+    if(!InpUseSessionFilter) return true;
+
+    MqlDateTime gmtTime;
+    TimeToStruct(TimeGMT(), gmtTime);
+    int hour = gmtTime.hour;
+
+    if(IsHourBlocked(hour)) return false;
+
+    bool inLondon = InpEnableLondon && IsHourInSession(hour, InpLondonStartHour, InpLondonEndHour);
+    bool inNY     = InpEnableNY     && IsHourInSession(hour, InpNYStartHour,     InpNYEndHour);
+    bool inAsia   = InpEnableAsia   && IsHourInSession(hour, InpAsiaStartHour,   InpAsiaEndHour);
+
+    return inLondon || inNY || inAsia;
+}
+
+//+------------------------------------------------------------------+
+//| Check for trade signals                                          |
+//+------------------------------------------------------------------+
+void CheckTradeSignals()
+{
+    if(!InpEnableTrade) return;
+
+    bool trendChanged = (trend != prevTrend);
+    if(!trendChanged) return;
+
+    bool buySignal = (trend == 1 && prevTrend == -1);
+    bool sellSignal = (trend == -1 && prevTrend == 1);
+
+    double currentHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double currentLow = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double currentClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+    // === EMA TOUCH FILTER: Preis muss während Pullback über/unter Slow EMA gewesen sein ===
+    bool emaAllowsLong = true;
+    bool emaAllowsShort = true;
+    if(InpUseEMAFilter)
+    {
+        // ATOMAR: Verwende gespeicherten EMA-Status vom ST-Wechsel
+        emaAllowsLong = emaConditionMetAtSTChange;     // Preis war unter SlowEMA während Pullback
+        emaAllowsShort = emaConditionMetAtSTChangeShort; // Preis war über SlowEMA während Pullback
+    }
+
+    // === TREND FILTER: 3-Mode System (identisch mit Pine) ===
+    bool allowLong = false;
+    bool allowShort = false;
+
+    if(!InpUseHTF)
+    {
+        // Modus 1: Nur CTF-Trend
+        allowLong = isUptrend;
+        allowShort = isDowntrend;
+    }
+    else if(InpRequireHTFAlignment)
+    {
+        // Modus 2: CTF und HTF müssen aligned sein
+        allowLong = isUptrend && (htfLastBOS == "UP");
+        allowShort = isDowntrend && (htfLastBOS == "DOWN");
+    }
+    else
+    {
+        // Modus 3: Nur HTF-Richtung
+        allowLong = (htfLastBOS == "UP");
+        allowShort = (htfLastBOS == "DOWN");
+    }
+
+    // === LOCAL LEG ATR FILTER: Aktuelles Pullback-Bein muss mind. N x ATR gross sein (Chop-Filter) ===
+    // LONG: lastUptrendHigh - lastDowntrendLow = Grösse des aktuellen Retracings
+    // SHORT: lastUptrendHigh - lastDowntrendLow = Grösse des aktuellen Up-Retracements
+    bool localLegWide = true;
+    bool localLegWideShort = true;
+    double atrFilterVal[];
+    ArraySetAsSeries(atrFilterVal, true);
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrFilterVal) > 0)
+    {
+        double atrNow = atrFilterVal[0];
+        double minLeg = InpLocalLegATRMultiplier * atrNow;
+        if(lastUptrendHigh > 0 && lastDowntrendLow > 0)
+        {
+            double localLeg = lastUptrendHigh - lastDowntrendLow;
+            localLegWide      = (localLeg >= minLeg);  // LONG: Pullback-Bein gross genug?
+            localLegWideShort = (localLeg >= minLeg);  // SHORT: Up-Retracement gross genug?
+            if(!localLegWide)
+                Print("LOCAL LEG FILTER: Leg=", localLeg, " < ", InpLocalLegATRMultiplier, "x ATR=", minLeg, " -> Trade blockiert");
+        }
+    }
+
+    // === SESSION FILTER ===
+    bool inSession = IsInSession();
+
+    // === ADX FILTER ===
+    bool adxOK = !InpUseADXFilter || !InpADXTradeFilter || (adxMA >= InpADXMinimum && adxMA <= InpADXMaximum);
+
+    // === BUY Signal ===
+    if(buySignal && allowLong && emaAllowsLong && localLegWide && (InpAllowLongTrades != LONG_OFF) && inSession && adxOK
+       && !(InpOnlyOneTradePerSwing && swingLongUsed))
+    {
+        if(PositionSelect(_Symbol))
+        {
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                trade.PositionClose(_Symbol);
+        }
+
+        bool isBuyHold = (InpAllowLongTrades == LONG_BUY_HOLD);
+
+        swingLongUsed = true;  // Trade in diesem Pullback-Arm markieren
+        // SL = lokales Tief der Pullback-Phase (lastDowntrendLow = tiefster Punkt während ST DOWN)
+        double stopLoss = (lastDowntrendLow > 0) ? MathMin(lastDowntrendLow, currentLow) : currentLow * 0.98;
+        double targetTP = (validSH > 0) ? validSH : currentHigh * 1.02;
+
+        // Wenn festes RRR verwendet wird, berechne TP basierend auf RRR
+        if(InpUseFixedRRR)
+        {
+            double risk = MathAbs(currentClose - stopLoss);
+            targetTP = currentClose + risk * InpRiskRewardRatio;
+        }
+
+        // Override mit manuellen Points falls gesetzt
+        if(InpStopLossPoints > 0)
+            stopLoss = currentLow - InpStopLossPoints * _Point;
+        if(InpTakeProfitPoints > 0)
+            targetTP = currentHigh + InpTakeProfitPoints * _Point;
+
+        // Buy & Hold: kein SL, kein TP
+        if(isBuyHold) { stopLoss = 0; targetTP = 0; }
+
+        tradeEntryPrice  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        tradeTargetTP    = targetTP;
+        tradeStopLoss    = stopLoss;
+        tradeInitialRisk = MathAbs(tradeEntryPrice - stopLoss);
+        beTriggered      = false;
+        tpTriggered      = false;
+        isLongTrade      = true;
+        partialClosed    = false;
+        tradeActive      = true;
+
+        // Bei Scaling SL oder Buy&Hold: kein harter TP im Order
+        double _buyTP = (InpTrailMode != TRAIL_OFF || isBuyHold) ? 0 : targetTP;
+        string _buyComment = isBuyHold ? "DTFX BUY&HOLD" : "DTFX LONG";
+        trade.Buy(InpLotSize, _Symbol, 0, stopLoss, _buyTP, _buyComment);
+        if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
+            LogTrade("BUY", tradeEntryPrice, stopLoss, targetTP, allowLong, emaAllowsLong, localLegWide, true, htfLastBOS == "UP");
+        // Dashboard-Snapshot
+        { double _atrS[]; ArraySetAsSeries(_atrS, true);
+          double _atrV = (CopyBuffer(atrHandle, 0, 0, 1, _atrS) > 0) ? _atrS[0] : 0;
+          dashEntryDir    = isBuyHold ? "BUY&HOLD" : "LONG";
+          dashEntryLeg    = (lastUptrendHigh > 0 && lastDowntrendLow > 0) ? lastUptrendHigh - lastDowntrendLow : 0;
+          dashEntryMinLeg = InpLocalLegATRMultiplier * _atrV;
+          dashEntryLegOK  = localLegWide; }
+
+        Print(isBuyHold ? "BUY&HOLD Signal: Entry=" : "LONG Signal: Entry=", tradeEntryPrice, " SL=", stopLoss, " TP=", targetTP,
+              " | CTF=", (isUptrend ? "UP" : "DOWN"),
+              " HTF=", htfLastBOS,
+              " EMA Touch=", (emaAllowsLong ? "YES" : "NO"),
+              " LocalLeg=", (localLegWide ? "OK" : "FAIL"));
+
+        // Reset EMA Flag nach Trade
+        emaConditionMetAtSTChange = false;
+    }
+    else if(buySignal && (!allowLong || !emaAllowsLong || !localLegWide || !inSession))
+    {
+        Print("LONG Signal BLOCKIERT: allowLong=", allowLong, " emaTouchOK=", emaAllowsLong,
+              " localLegWide=", localLegWide, " inSession=", inSession,
+              " | CTF=", (isUptrend ? "UP" : "DOWN"), " HTF=", htfLastBOS);
+        // Reset EMA Flag auch bei blockiertem Signal
+        emaConditionMetAtSTChange = false;
+    }
+
+    // === SHORT Signal ===
+    if(sellSignal && allowShort && emaAllowsShort && localLegWideShort && InpAllowShortTrades && inSession && adxOK
+       && !(InpOnlyOneTradePerSwing && swingShortUsed))
+    {
+        if(PositionSelect(_Symbol))
+        {
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                trade.PositionClose(_Symbol);
+        }
+
+        swingShortUsed = true;  // Trade in diesem Pullback-Arm markieren
+        // SL = lokales Hoch der Pullback-Phase (lastUptrendHigh = höchster Punkt während ST UP)
+        double stopLoss = (lastUptrendHigh > 0) ? MathMax(lastUptrendHigh, currentHigh) : currentHigh * 1.02;
+        double targetTP = (validSL > 0) ? validSL : currentLow * 0.98;
+
+        // Wenn festes RRR verwendet wird, berechne TP basierend auf RRR
+        if(InpUseFixedRRR)
+        {
+            double risk = MathAbs(currentClose - stopLoss);
+            targetTP = currentClose - risk * InpRiskRewardRatio;
+        }
+
+        // Override mit manuellen Points falls gesetzt
+        if(InpStopLossPoints > 0)
+            stopLoss = currentHigh + InpStopLossPoints * _Point;
+        if(InpTakeProfitPoints > 0)
+            targetTP = currentLow - InpTakeProfitPoints * _Point;
+
+        tradeEntryPrice  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        tradeTargetTP    = targetTP;
+        tradeStopLoss    = stopLoss;
+        tradeInitialRisk = MathAbs(tradeEntryPrice - stopLoss);
+        beTriggered      = false;
+        tpTriggered      = false;
+        isLongTrade      = false;
+        partialClosed    = false;
+        tradeActive      = true;
+
+        // Bei Scaling SL: kein harter TP im Order – wird in ManageOpenTrades als Trigger verwaltet
+        double _sellTP = (InpTrailMode != TRAIL_OFF) ? 0 : targetTP;
+        trade.Sell(InpLotSize, _Symbol, 0, stopLoss, _sellTP, "DTFX SHORT");
+        if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
+            LogTrade("SELL", tradeEntryPrice, stopLoss, targetTP, allowShort, emaAllowsShort, localLegWideShort, true, htfLastBOS == "DOWN");
+        // Dashboard-Snapshot
+        { double _atrS[]; ArraySetAsSeries(_atrS, true);
+          double _atrV = (CopyBuffer(atrHandle, 0, 0, 1, _atrS) > 0) ? _atrS[0] : 0;
+          dashEntryDir    = "SHORT";
+          dashEntryLeg    = (lastUptrendHigh > 0 && lastDowntrendLow > 0) ? lastUptrendHigh - lastDowntrendLow : 0;
+          dashEntryMinLeg = InpLocalLegATRMultiplier * _atrV;
+          dashEntryLegOK  = localLegWideShort; }
+
+        Print("SHORT Signal: Entry=", tradeEntryPrice, " SL=", stopLoss, " TP=", targetTP,
+              " | CTF=", (isDowntrend ? "DOWN" : "UP"),
+              " HTF=", htfLastBOS,
+              " EMA Touch=", (emaAllowsShort ? "YES" : "NO"),
+              " LocalLeg=", (localLegWideShort ? "OK" : "FAIL"));
+
+        // Reset EMA Flag nach Trade
+        emaConditionMetAtSTChangeShort = false;
+    }
+    else if(sellSignal && (!allowShort || !emaAllowsShort || !localLegWideShort || !inSession))
+    {
+        Print("SHORT Signal BLOCKIERT: allowShort=", allowShort, " emaTouchOK=", emaAllowsShort,
+              " localLegWide=", localLegWideShort, " inSession=", inSession,
+              " | CTF=", (isDowntrend ? "DOWN" : "UP"), " HTF=", htfLastBOS);
+        // Reset EMA Flag auch bei blockiertem Signal
+        emaConditionMetAtSTChangeShort = false;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open trades                                               |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+    if(!PositionSelect(_Symbol))
+    {
+        tradeActive      = false;
+        tradeEntryPrice  = 0;
+        tradeTargetTP    = 0;
+        tradeStopLoss    = 0;
+        tradeInitialRisk = 0;
+        beTriggered      = false;
+        tpTriggered      = false;
+        partialClosed    = false;
+        return;
+    }
+
+    if(!tradeActive) return;
+
+    // Buy & Hold: keine SL/BE/Trail-Verwaltung – Position läuft bis zum manuellen Close oder HTF-Exit
+    if(isLongTrade && InpAllowLongTrades == LONG_BUY_HOLD)
+        return;
+
+    double currentSL    = PositionGetDouble(POSITION_SL);
+    double currentTP    = PositionGetDouble(POSITION_TP);
+    double currentBid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double currentAsk   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double currentPrice = isLongTrade ? currentBid : currentAsk;
+    double newSL        = currentSL;
+    bool   modifyNeeded = false;
+
+    // === BREAKEVEN ===
+    if(InpUseBreakeven && !beTriggered && tradeInitialRisk > 0)
+    {
+        if(isLongTrade && currentPrice >= tradeEntryPrice + InpBreakevenR * tradeInitialRisk)
+        {
+            newSL       = MathMax(newSL, tradeEntryPrice);
+            beTriggered = true;
+            modifyNeeded = true;
+            Print("[BE] Long: SL → Entry ", tradeEntryPrice, " bei Preis ", currentPrice);
+        }
+        else if(!isLongTrade && currentPrice <= tradeEntryPrice - InpBreakevenR * tradeInitialRisk)
+        {
+            newSL       = (newSL > 0) ? MathMin(newSL, tradeEntryPrice) : tradeEntryPrice;
+            beTriggered = true;
+            modifyNeeded = true;
+            Print("[BE] Short: SL → Entry ", tradeEntryPrice, " bei Preis ", currentPrice);
+        }
+    }
+
+    // === SCALING SL ===
+    if(InpTrailMode != TRAIL_OFF)
+    {
+        // Phase 1: TP-Level als Trigger
+        if(!tpTriggered && tradeTargetTP > 0)
+        {
+            bool tpHit = isLongTrade ? (currentPrice >= tradeTargetTP) : (currentPrice <= tradeTargetTP);
+            if(tpHit)
+            {
+                tpTriggered = true;
+                Print("[Scaling] TP-Level ", tradeTargetTP, " erreicht → Runner aktiv (",
+                      (InpTrailMode == TRAIL_BOS ? "BOS" : "Supertrend"), ")");
+
+                // SL auf Entry setzen (Basis für beide Modi)
+                if(isLongTrade)
+                    newSL = MathMax(newSL, tradeEntryPrice);
+                else
+                    newSL = (newSL > 0) ? MathMin(newSL, tradeEntryPrice) : tradeEntryPrice;
+                modifyNeeded = true;
+
+                // Partial Close falls gewünscht
+                if(InpUsePartialClose && !partialClosed)
+                {
+                    double posVol   = PositionGetDouble(POSITION_VOLUME);
+                    double closeVol = NormalizeDouble(posVol * InpPartialClosePercent / 100.0, 2);
+                    double minVol   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+                    if(closeVol >= minVol && (posVol - closeVol) >= minVol)
+                    {
+                        if(trade.PositionClosePartial(_Symbol, closeVol))
+                        {
+                            partialClosed = true;
+                            Print("[Partial] ", closeVol, " Lots geschlossen bei TP ", tradeTargetTP);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Nach TP-Trigger – Trailing nach gewähltem Modus
+        if(tpTriggered)
+        {
+            if(InpTrailMode == TRAIL_BOS)
+            {
+                // BOS-Trailing: SL folgt bestätigten Swing-Lows/-Highs
+                // Nutzt validSL UND lastDowntrendLow/lastUptrendHigh als Fallback,
+                // da validSL nur bei BOS+ST-Flip updatet, lastXxxLow/High bei jedem ST-Flip
+                if(isLongTrade)
+                {
+                    double trailCandidate = 0;
+                    if(validSL > 0)          trailCandidate = validSL;
+                    if(lastDowntrendLow > 0) trailCandidate = MathMax(trailCandidate, lastDowntrendLow);
+                    if(trailCandidate > newSL)
+                    {
+                        Print("[Trail-BOS] Long SL: ", DoubleToString(newSL, _Digits),
+                              " → ", DoubleToString(trailCandidate, _Digits),
+                              "  (validSL=", DoubleToString(validSL, _Digits),
+                              " lastDTLow=", DoubleToString(lastDowntrendLow, _Digits), ")");
+                        newSL        = trailCandidate;
+                        modifyNeeded = true;
+                    }
+                }
+                else
+                {
+                    double trailCandidate = 0;
+                    if(validSH > 0)          trailCandidate = validSH;
+                    if(lastUptrendHigh > 0)  trailCandidate = (trailCandidate > 0) ? MathMin(trailCandidate, lastUptrendHigh) : lastUptrendHigh;
+                    if(trailCandidate > 0 && newSL > 0 && trailCandidate < newSL)
+                    {
+                        Print("[Trail-BOS] Short SL: ", DoubleToString(newSL, _Digits),
+                              " → ", DoubleToString(trailCandidate, _Digits),
+                              "  (validSH=", DoubleToString(validSH, _Digits),
+                              " lastUTHigh=", DoubleToString(lastUptrendHigh, _Digits), ")");
+                        newSL        = trailCandidate;
+                        modifyNeeded = true;
+                    }
+                }
+            }
+            else if(InpTrailMode == TRAIL_ST)
+            {
+                // ST-Trailing: SL folgt dem aktuellen Supertrend-Level tickweise
+                // Long:  SL = upBuffer[0]  (ST-Unterstützungslinie, steigt im Auftrend)
+                // Short: SL = dnBuffer[0]  (ST-Widerstandslinie, fällt im Abwärtstrend)
+                // SL wird ausschließlich enger gezogen, nie schlechter
+                if(isLongTrade && ArraySize(upBuffer) > 0)
+                {
+                    double stLevel = upBuffer[0];
+                    if(stLevel > 0 && stLevel > newSL)
+                    {
+                        Print("[Trail-ST] Long SL: ", DoubleToString(newSL, _Digits),
+                              " → ST ", DoubleToString(stLevel, _Digits));
+                        newSL        = stLevel;
+                        modifyNeeded = true;
+                    }
+                }
+                else if(!isLongTrade && ArraySize(dnBuffer) > 0)
+                {
+                    double stLevel = dnBuffer[0];
+                    if(stLevel > 0 && newSL > 0 && stLevel < newSL)
+                    {
+                        Print("[Trail-ST] Short SL: ", DoubleToString(newSL, _Digits),
+                              " → ST ", DoubleToString(stLevel, _Digits));
+                        newSL        = stLevel;
+                        modifyNeeded = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Modifikation ausführen wenn nötig
+    if(modifyNeeded && MathAbs(newSL - currentSL) > _Point)
+    {
+        tradeStopLoss = newSL;
+        // Bei Scaling SL kein harter TP im Order halten (Runner läuft weiter)
+        double newTP = (InpTrailMode != TRAIL_OFF && tpTriggered) ? 0 : currentTP;
+        if(trade.PositionModify(_Symbol, NormalizeDouble(newSL, _Digits), NormalizeDouble(newTP, _Digits)))
+            Print("[Modify] SL → ", DoubleToString(newSL, _Digits),
+                  (beTriggered ? " [BE]" : ""), (tpTriggered ? " [Trail]" : ""));
+        else
+            Print("[Modify] Fehler: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Swing Label                                                  |
+//+------------------------------------------------------------------+
+void DrawSwingLabel(string name, int shift, double price, string text, color col, bool isHigh)
+{
+    datetime time = iTime(_Symbol, PERIOD_CURRENT, shift);
+
+    if(ObjectFind(0, name) >= 0)
+        ObjectDelete(0, name);
+
+    // Berechne Offset basierend auf ATR für bessere Sichtbarkeit
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    double offsetDistance = 0;
+
+    if(CopyBuffer(atrHandle, 0, shift, 1, atr) > 0)
+        offsetDistance = atr[0] * 0.5;  // 50% des ATR als Offset
+    else
+        offsetDistance = (iHigh(_Symbol, PERIOD_CURRENT, shift) - iLow(_Symbol, PERIOD_CURRENT, shift)) * 2;
+
+    // Preis mit Offset: über dem High für Highs, unter dem Low für Lows
+    double adjustedPrice = isHigh ? (price + offsetDistance) : (price - offsetDistance);
+
+    // Verwende echte Dreiecke: Rot nach unten für High, Grün nach oben für Low
+    color triangleColor = isHigh ? clrRed : clrLime;
+
+    // Größe des Dreiecks in Preis-Einheiten
+    double triangleSize = offsetDistance * 0.3;
+    datetime timeOffset = PeriodSeconds(PERIOD_CURRENT);
+
+    // Dreieck-Koordinaten berechnen
+    datetime time1, time2, time3;
+    double price1, price2, price3;
+
+    if(isHigh)
+    {
+        // Dreieck zeigt nach OBEN (für High) - 180° gedreht
+        time1 = time - timeOffset;
+        price1 = adjustedPrice + triangleSize;
+
+        time2 = time + timeOffset;
+        price2 = adjustedPrice + triangleSize;
+
+        time3 = time;
+        price3 = adjustedPrice;
+    }
+    else
+    {
+        // Dreieck zeigt nach UNTEN (für Low) - 180° gedreht
+        time1 = time - timeOffset;
+        price1 = adjustedPrice - triangleSize;
+
+        time2 = time + timeOffset;
+        price2 = adjustedPrice - triangleSize;
+
+        time3 = time;
+        price3 = adjustedPrice;
+    }
+
+    if(ObjectCreate(0, name, OBJ_TRIANGLE, 0, time1, price1, time2, price2, time3, price3))
+    {
+        ObjectSetInteger(0, name, OBJPROP_COLOR, triangleColor);
+        ObjectSetInteger(0, name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, name, OBJPROP_BACK, false);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create Dashboard                                                  |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+    int xPos = InpDashboardX;
+    int yPos = InpDashboardY;
+    int width = 250;
+    int height = 365;  // Erhöht für LocalLeg Zeilen + ADX
+
+    string bgName = dashboardName + "_BG";
+    if(ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+    {
+        ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, xPos);
+        ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, yPos);
+        ObjectSetInteger(0, bgName, OBJPROP_XSIZE, width);
+        ObjectSetInteger(0, bgName, OBJPROP_YSIZE, height);
+        ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, InpDashboardBgColor);
+        ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+        ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetInteger(0, bgName, OBJPROP_BACK, true);
+    }
+
+    CreateDashboardLabel(dashboardName + "_Title", xPos + 10, yPos + 10, "DTFX STRATEGY CONTROL", clrWhite, 12);
+    CreateDashboardLabel(dashboardName + "_Trend", xPos + 10, yPos + 35, "CTF Trend: NONE", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_HTFTrend", xPos + 10, yPos + 55, "HTF Trend: NONE", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_STTrend", xPos + 10, yPos + 80, "ST Trend: NONE", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_SwingHigh", xPos + 10, yPos + 100, "CTF High: 0.00000", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_SwingLow", xPos + 10, yPos + 120, "CTF Low: 0.00000", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_HTFSwingHigh", xPos + 10, yPos + 140, "HTF High: 0.00000", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_HTFSwingLow", xPos + 10, yPos + 160, "HTF Low: 0.00000", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_HTFAlignment", xPos + 10, yPos + 180, "HTF Aligned: NO", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_Position", xPos + 10, yPos + 200, "Position: NONE", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_EMACondition", xPos + 10, yPos + 220, "EMA ✓: False",      InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_LocalLeg",     xPos + 10, yPos + 250, "Leg: --- / min ---", InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_LegStatus",    xPos + 10, yPos + 285, "Filters: ...",       InpDashboardTextColor, 10);
+    CreateDashboardLabel(dashboardName + "_ADX",          xPos + 10, yPos + 315, "ADX: --",            InpDashboardTextColor, 10);
+}
+
+//+------------------------------------------------------------------+
+//| Create Dashboard Label                                           |
+//+------------------------------------------------------------------+
+void CreateDashboardLabel(string name, int x, int y, string text, color col, int fontSize)
+{
+    if(ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+    {
+        ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+        ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+        ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+        ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetString(0, name, OBJPROP_TEXT, text);
+        ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update Dashboard                                                  |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+    // Update Trend
+    string trendText = lastBOS == "UP" ? "UPTREND" : (lastBOS == "DOWN" ? "DOWNTREND" : "NONE");
+    color trendColor = lastBOS == "UP" ? clrLime : (lastBOS == "DOWN" ? clrRed : clrGray);
+    ObjectSetString(0, dashboardName + "_Trend", OBJPROP_TEXT, "CTF Trend: " + trendText);
+    ObjectSetInteger(0, dashboardName + "_Trend", OBJPROP_COLOR, trendColor);
+
+    // Update HTF Trend
+    string htfTrendText = htfLastBOS == "UP" ? "UPTREND" : (htfLastBOS == "DOWN" ? "DOWNTREND" : "NONE");
+    color htfTrendColor = htfLastBOS == "UP" ? clrLime : (htfLastBOS == "DOWN" ? clrRed : clrGray);
+    ObjectSetString(0, dashboardName + "_HTFTrend", OBJPROP_TEXT, "HTF Trend: " + htfTrendText);
+    ObjectSetInteger(0, dashboardName + "_HTFTrend", OBJPROP_COLOR, htfTrendColor);
+
+    // Update ST Trend
+    string stText = trend == 1 ? "UPTREND" : "DOWNTREND";
+    color stColor = trend == 1 ? clrLime : clrRed;
+    ObjectSetString(0, dashboardName + "_STTrend", OBJPROP_TEXT, "ST Trend: " + stText);
+    ObjectSetInteger(0, dashboardName + "_STTrend", OBJPROP_COLOR, stColor);
+
+    // Update Swing High
+    ObjectSetString(0, dashboardName + "_SwingHigh", OBJPROP_TEXT, "CTF High: " + DoubleToString(validSH, _Digits));
+
+    // Update Swing Low
+    ObjectSetString(0, dashboardName + "_SwingLow", OBJPROP_TEXT, "CTF Low: " + DoubleToString(validSL, _Digits));
+
+    // Update HTF Swing High
+    ObjectSetString(0, dashboardName + "_HTFSwingHigh", OBJPROP_TEXT, "HTF High: " + DoubleToString(htfValidSH, _Digits));
+
+    // Update HTF Swing Low
+    ObjectSetString(0, dashboardName + "_HTFSwingLow", OBJPROP_TEXT, "HTF Low: " + DoubleToString(htfValidSL, _Digits));
+
+    // Update HTF Alignment Status
+    bool htfAlignedUp = IsHTFAligned("UP");
+    bool htfAlignedDown = IsHTFAligned("DOWN");
+    string htfAlignText = "NO";
+    color htfAlignColor = clrRed;
+
+    if(InpUseHTF && InpRequireHTFAlignment)
+    {
+        if(lastBOS == "UP" && htfAlignedUp)
+        {
+            htfAlignText = "YES (UP)";
+            htfAlignColor = clrLime;
+        }
+        else if(lastBOS == "DOWN" && htfAlignedDown)
+        {
+            htfAlignText = "YES (DOWN)";
+            htfAlignColor = clrLime;
+        }
+        else
+        {
+            htfAlignText = "NO (CTF:" + lastBOS + " HTF:" + htfLastBOS + ")";
+            htfAlignColor = clrRed;
+        }
+    }
+    else if(InpUseHTF && !InpRequireHTFAlignment)
+    {
+        htfAlignText = "OPTIONAL";
+        htfAlignColor = clrYellow;
+    }
+    else
+    {
+        htfAlignText = "DISABLED";
+        htfAlignColor = clrGray;
+    }
+
+    ObjectSetString(0, dashboardName + "_HTFAlignment", OBJPROP_TEXT, "HTF Aligned: " + htfAlignText);
+    ObjectSetInteger(0, dashboardName + "_HTFAlignment", OBJPROP_COLOR, htfAlignColor);
+
+    // Update Position
+    string posText = "NONE";
+    color posColor = clrGray;
+    if(PositionSelect(_Symbol))
+    {
+        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        if(posType == POSITION_TYPE_BUY)
+        {
+            posText = "LONG";
+            posColor = clrLime;
+        }
+        else
+        {
+            posText = "SHORT";
+            posColor = clrRed;
+        }
+    }
+    ObjectSetString(0, dashboardName + "_Position", OBJPROP_TEXT, "Position: " + posText);
+    ObjectSetInteger(0, dashboardName + "_Position", OBJPROP_COLOR, posColor);
+
+    // Update EMA Condition
+    string emaConditionText = "OFF";
+    if(InpUseEMAFilter)
+    {
+        emaConditionText = (priceWasBelowSlowEMA && priceWasAboveSlowEMA) ? "BOTH" :
+                           (priceWasBelowSlowEMA) ? "BELOW ✓" :
+                           (priceWasAboveSlowEMA) ? "ABOVE ✓" : "WAITING";
+    }
+    ObjectSetString(0, dashboardName + "_EMACondition", OBJPROP_TEXT, "EMA Touch: " + emaConditionText);
+
+    // === LOCAL LEG FILTER STATUS ===
+    double atrDash[];
+    ArraySetAsSeries(atrDash, true);
+    double atrNowDash = 0;
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrDash) > 0) atrNowDash = atrDash[0];
+
+    bool inPos = PositionSelect(_Symbol);
+
+    string legText;
+    color  legColor;
+    string legStatusText;
+    color  legStatusColor;
+
+    if(inPos && dashEntryDir != "-")
+    {
+        // --- IN POSITION: Zeige Snapshot vom Entry-Moment ---
+        legText = dashEntryDir + " @Entry: Leg " + DoubleToString(dashEntryLeg, 1) +
+                  "pt / min " + DoubleToString(dashEntryMinLeg, 1) +
+                  "pt  " + (dashEntryLegOK ? "OK" : "FAIL");
+        legColor = dashEntryLegOK ? clrLime : clrRed;
+
+        legStatusText  = "IN POS (" + dashEntryDir + ")  ATR@E:" + DoubleToString(dashEntryMinLeg / InpLocalLegATRMultiplier, 1);
+        legStatusColor = clrAqua;
+    }
+    else
+    {
+        // --- KEIN TRADE: Live-Tracking des laufenden Beins ---
+        double minLegDash = InpLocalLegATRMultiplier * atrNowDash;
+        double liveLeg;
+        string dirLabel, phaseLabel;
+
+        if(trend == -1)  // Pullback läuft → LONG Setup
+        {
+            dirLabel   = "LONG";
+            phaseLabel = "Pullback";
+            liveLeg    = (lastUptrendHigh > 0 && currentDowntrendLow > 0)
+                         ? lastUptrendHigh - currentDowntrendLow : 0;
+        }
+        else  // trend == 1 → Retrace läuft → SHORT Setup
+        {
+            dirLabel   = "SHORT";
+            phaseLabel = "Retrace";
+            liveLeg    = (currentUptrendHigh > 0 && lastDowntrendLow > 0)
+                         ? currentUptrendHigh - lastDowntrendLow : 0;
+        }
+
+        bool legOKDash = (liveLeg > 0 && liveLeg >= minLegDash);
+
+        if(liveLeg == 0)
+        { legText = dirLabel + " " + phaseLabel + ": warte auf HH/LL..."; legColor = clrGray; }
+        else
+        {
+            legText = dirLabel + " " + phaseLabel + ": " + DoubleToString(liveLeg, 1) +
+                      "pt  (min " + DoubleToString(minLegDash, 1) + "pt = " +
+                      DoubleToString(InpLocalLegATRMultiplier, 1) + "xATR)  " +
+                      (legOKDash ? "OK" : "FAIL");
+            legColor = legOKDash ? clrLime : clrRed;
+        }
+
+        legStatusText  = (legOKDash ? "Leg:OK" : "Leg:FAIL") + "   ATR:" + DoubleToString(atrNowDash, 1);
+        legStatusColor = legOKDash ? clrLime : clrRed;
+    }
+
+    ObjectSetString(0, dashboardName + "_LocalLeg", OBJPROP_TEXT, legText);
+    ObjectSetInteger(0, dashboardName + "_LocalLeg", OBJPROP_COLOR, legColor);
+    ObjectSetString(0, dashboardName + "_LegStatus", OBJPROP_TEXT, legStatusText);
+    ObjectSetInteger(0, dashboardName + "_LegStatus", OBJPROP_COLOR, legStatusColor);
+
+    // ADX Filter
+    if(InpUseADXFilter)
+    {
+        bool adxOKDash = !InpADXTradeFilter || (adxMA >= InpADXMinimum && adxMA <= InpADXMaximum);
+        color adxClrDash = adxOKDash ? clrLime : clrRed;
+        ObjectSetString(0, dashboardName + "_ADX", OBJPROP_TEXT,
+                       "ADX: " + DoubleToString(adxValue, 1) + " / MA: " + DoubleToString(adxMA, 1) +
+                       (adxOKDash ? " ✓" : " ✗"));
+        ObjectSetInteger(0, dashboardName + "_ADX", OBJPROP_COLOR, adxClrDash);
+    }
+    else
+    {
+        ObjectSetString(0, dashboardName + "_ADX", OBJPROP_TEXT, "ADX: OFF");
+        ObjectSetInteger(0, dashboardName + "_ADX", OBJPROP_COLOR, clrGray);
+    }
+
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Delete all objects created by EA                                 |
+//+------------------------------------------------------------------+
+void DeleteAllObjects()
+{
+    for(int i = ObjectsTotal(0, 0, -1) - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(0, i, 0, -1);
+        if(StringFind(objName, dashboardName) >= 0 ||
+           StringFind(objName, "SH_") >= 0 ||
+           StringFind(objName, "SL_") >= 0 ||
+           StringFind(objName, "HTF_SH_") >= 0 ||
+           StringFind(objName, "HTF_SL_") >= 0 ||
+           StringFind(objName, stLinePrefix) >= 0 ||
+           StringFind(objName, htfStLinePrefix) >= 0 ||
+           StringFind(objName, "DTFX_EMA_") >= 0)
+        {
+            ObjectDelete(0, objName);
+        }
+    }
+
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Initialize HTF Swing Structure                                   |
+//+------------------------------------------------------------------+
+void InitializeHTFSwingStructure()
+{
+    if(!InpUseHTF) return;
+
+    // Mindestens 2 HTF-Bars: Schnell-Init per Preisposition möglich; voller Warmup ab InpSTperiod+4
+    int htfBars = iBars(_Symbol, InpHTFTimeframe);
+    if(htfBars < 2)
+        return;
+
+    // Vollständiger Supertrend-Warmup – kalibriert htfTrend, Buffers, Swings & BOS korrekt
+    WarmupHTFSupertrend();
+
+    if(!htfInitialized)
+    {
+        Print("HTF Init: WarmupHTFSupertrend fehlgeschlagen");
+        return;
+    }
+
+    // Initiale HTF Swing Labels zeichnen (nur ohne Warmup – mit Warmup werden Labels im Loop gezeichnet)
+    if(InpShowSwingLabels && htfValidSH > 0 && InpWarmupBars <= 0)
+    {
+        int labelWindow = MathMin(htfBars - 1, 34);
+        if(labelWindow >= 1)
+        {
+            int htfHighestBar = iHighest(_Symbol, InpHTFTimeframe, MODE_HIGH, labelWindow, 1);
+            int htfLowestBar  = iLowest (_Symbol, InpHTFTimeframe, MODE_LOW,  labelWindow, 1);
+            DrawHTFSwingLabel("HTF_SH_init", htfHighestBar, htfValidSH, "HTF H", true);
+            DrawHTFSwingLabel("HTF_SL_init", htfLowestBar,  htfValidSL, "HTF L", false);
+        }
+    }
+
+    Print("HTF initialisiert: Trend=", htfTrend == 1 ? "UP" : "DOWN",
+          " BOS=", htfLastBOS, " SH=", htfValidSH, " SL=", htfValidSL,
+          " TF=", EnumToString(InpHTFTimeframe));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate HTF Supertrend                                         |
+//+------------------------------------------------------------------+
+void CalculateHTFSupertrend()
+{
+    if(!InpUseHTF || htfAtrHandle == INVALID_HANDLE) return;
+
+    double htfAtr[];
+    ArraySetAsSeries(htfAtr, true);
+
+    if(CopyBuffer(htfAtrHandle, 0, 0, 3, htfAtr) < 3)
+        return;
+
+    double htfHigh1 = iHigh(_Symbol, InpHTFTimeframe, 1);
+    double htfLow1 = iLow(_Symbol, InpHTFTimeframe, 1);
+    double htfClose1 = iClose(_Symbol, InpHTFTimeframe, 1);
+    double htfClose2 = iClose(_Symbol, InpHTFTimeframe, 2);
+
+    double htfSrc = (htfHigh1 + htfLow1) / 2.0;
+    double htfUp = htfSrc - (InpSTmultiplier * htfAtr[1]);
+    double htfDn = htfSrc + (InpSTmultiplier * htfAtr[1]);
+
+    double htfPrevUp = 0;
+    double htfPrevDn = 0;
+
+    if(ArraySize(htfUpBuffer) > 0)
+    {
+        htfPrevUp = htfUpBuffer[0];
+        htfPrevDn = htfDnBuffer[0];
+    }
+    else
+    {
+        htfPrevUp = htfUp;
+        htfPrevDn = htfDn;
+    }
+
+    // ECHTE SUPERTREND LOGIK (wie beim CTF)
+    if(htfClose2 > htfPrevUp)
+        htfUp = MathMax(htfUp, htfPrevUp);
+    if(htfClose2 < htfPrevDn)
+        htfDn = MathMin(htfDn, htfPrevDn);
+
+    // Buffer aktualisieren
+    ArrayResize(htfUpBuffer, ArraySize(htfUpBuffer) + 1);
+    ArrayResize(htfDnBuffer, ArraySize(htfDnBuffer) + 1);
+
+    for(int i = ArraySize(htfUpBuffer) - 1; i > 0; i--)
+    {
+        htfUpBuffer[i] = htfUpBuffer[i - 1];
+        htfDnBuffer[i] = htfDnBuffer[i - 1];
+    }
+
+    htfUpBuffer[0] = htfUp;
+    htfDnBuffer[0] = htfDn;
+
+    // Cap HTF buffer size to prevent unbounded memory growth
+    if(ArraySize(htfUpBuffer) > 4)
+    {
+        ArrayResize(htfUpBuffer, 4);
+        ArrayResize(htfDnBuffer, 4);
+    }
+
+    // === STEP 1: HTF EXTREMPUNKTE TRACKING MIT ALTEM TREND (VOR Trend-Bestimmung!) ===
+    if(htfTrend == 1)
+    {
+        if(htfHigh1 > htfCurrentUptrendHigh || htfCurrentUptrendHigh == 0)
+        {
+            htfCurrentUptrendHigh = htfHigh1;
+            htfCurrentUptrendHighTime = iTime(_Symbol, InpHTFTimeframe, 1);
+        }
+    }
+    if(htfTrend == -1)
+    {
+        if(htfLow1 < htfCurrentDowntrendLow || htfCurrentDowntrendLow == 0)
+        {
+            htfCurrentDowntrendLow = htfLow1;
+            htfCurrentDowntrendLowTime = iTime(_Symbol, InpHTFTimeframe, 1);
+        }
+    }
+
+    // === STEP 2: HTF TREND BESTIMMEN ===
+    htfPrevTrend = htfTrend;
+    if(htfTrend == -1 && htfClose1 > htfPrevDn)
+        htfTrend = 1;
+    else if(htfTrend == 1 && htfClose1 < htfPrevUp)
+        htfTrend = -1;
+
+    // === STEP 3: BEI TRENDWECHSEL: SPEICHERE EXTREMPUNKTE & INITIALISIERE NEUES TRACKING ===
+    bool htfTrendChanged = (htfTrend != htfPrevTrend && htfPrevTrend != 0);
+
+    if(htfTrendChanged)
+    {
+        if(htfTrend == -1)  // Wechsel zu DOWNTREND
+        {
+            htfLastUptrendHigh = htfCurrentUptrendHigh;
+            htfLastUptrendHighTime = htfCurrentUptrendHighTime;
+
+            Print("HTF ST Wechsel zu DOWN: HIGH = ", htfLastUptrendHigh, " bei Zeit ", TimeToString(htfLastUptrendHighTime));
+
+            // Initialisiere neues Downtrend-Tracking mit aktuellem Bar
+            htfCurrentDowntrendLow = htfLow1;
+            htfCurrentDowntrendLowTime = iTime(_Symbol, InpHTFTimeframe, 1);
+        }
+        else if(htfTrend == 1)  // Wechsel zu UPTREND
+        {
+            htfLastDowntrendLow = htfCurrentDowntrendLow;
+            htfLastDowntrendLowTime = htfCurrentDowntrendLowTime;
+
+            Print("HTF ST Wechsel zu UP: LOW = ", htfLastDowntrendLow, " bei Zeit ", TimeToString(htfLastDowntrendLowTime));
+
+            // Initialisiere neues Uptrend-Tracking mit aktuellem Bar
+            htfCurrentUptrendHigh = htfHigh1;
+            htfCurrentUptrendHighTime = iTime(_Symbol, InpHTFTimeframe, 1);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw HTF Supertrend Lines on Chart                               |
+//+------------------------------------------------------------------+
+void DrawHTFSupertrendLines()
+{
+    if(!InpShowHTFSupertrendLines || !InpUseHTF) return;
+    if(!htfInitialized || htfAtrHandle == INVALID_HANDLE) return;
+
+    int htfBars = iBars(_Symbol, InpHTFTimeframe);
+    if(htfBars < 4) return;
+    int maxBars = MathMin(htfBars, 200);  // Weniger Bars für HTF
+
+    // Delete old HTF supertrend objects
+    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(0, i);
+        if(StringFind(objName, htfStLinePrefix) >= 0)
+            ObjectDelete(0, objName);
+    }
+
+    // ATR und Preisdaten für HTF
+    double htfAtr[];
+    double htfHigh_arr[], htfLow_arr[], htfClose_arr[];
+    ArraySetAsSeries(htfAtr, true);
+    ArraySetAsSeries(htfHigh_arr, true);
+    ArraySetAsSeries(htfLow_arr, true);
+    ArraySetAsSeries(htfClose_arr, true);
+
+    if(CopyBuffer(htfAtrHandle, 0, 0, maxBars, htfAtr) <= 0) return;
+    if(CopyHigh(_Symbol, InpHTFTimeframe, 0, maxBars, htfHigh_arr) <= 0) return;
+    if(CopyLow(_Symbol, InpHTFTimeframe, 0, maxBars, htfLow_arr) <= 0) return;
+    if(CopyClose(_Symbol, InpHTFTimeframe, 0, maxBars, htfClose_arr) <= 0) return;
+
+    // Tatsächlich kopierte Bars verwenden
+    maxBars = MathMin(ArraySize(htfAtr), maxBars);
+
+    double htfUp_arr[], htfDn_arr[];
+    ArrayResize(htfUp_arr, maxBars);
+    ArrayResize(htfDn_arr, maxBars);
+    int htfTrend_arr[];
+    ArrayResize(htfTrend_arr, maxBars);
+
+    // Calculate HTF Supertrend values
+    for(int i = maxBars - 1; i >= 0; i--)
+    {
+        double htfSrc = (htfHigh_arr[i] + htfLow_arr[i]) / 2.0;
+        double htfUp = htfSrc - (InpSTmultiplier * htfAtr[i]);
+        double htfDn = htfSrc + (InpSTmultiplier * htfAtr[i]);
+
+        if(i < maxBars - 1)
+        {
+            double htfPrevUp = htfUp_arr[i + 1];
+            double htfPrevDn = htfDn_arr[i + 1];
+            double htfPrevClose = htfClose_arr[i + 1];
+
+            if(htfPrevClose > htfPrevUp)
+                htfUp = MathMax(htfUp, htfPrevUp);
+
+            if(htfPrevClose < htfPrevDn)
+                htfDn = MathMin(htfDn, htfPrevDn);
+
+            int localHtfPrevTrend = htfTrend_arr[i + 1];
+            int htfCurrentTrend = localHtfPrevTrend;
+
+            if(localHtfPrevTrend == -1 && htfClose_arr[i] > htfPrevDn)
+                htfCurrentTrend = 1;
+            else if(localHtfPrevTrend == 1 && htfClose_arr[i] < htfPrevUp)
+                htfCurrentTrend = -1;
+
+            htfTrend_arr[i] = htfCurrentTrend;
+        }
+        else
+        {
+            htfTrend_arr[i] = 1;
+        }
+
+        htfUp_arr[i] = htfUp;
+        htfDn_arr[i] = htfDn;
+    }
+
+    // Draw HTF Supertrend as trend line segments
+    // Blue when below price (uptrend), Magenta when above price (downtrend)
+    for(int i = maxBars - 2; i >= 0; i--)
+    {
+        datetime time1 = iTime(_Symbol, InpHTFTimeframe, i + 1);
+        datetime time2 = iTime(_Symbol, InpHTFTimeframe, i);
+
+        double price1, price2;
+        color lineColor;
+
+        if(htfTrend_arr[i + 1] == 1) // HTF Uptrend - blue line below price
+        {
+            price1 = htfUp_arr[i + 1];
+            price2 = htfUp_arr[i];
+            lineColor = InpHTFSupertrendUpColor;
+        }
+        else // HTF Downtrend - magenta line above price
+        {
+            price1 = htfDn_arr[i + 1];
+            price2 = htfDn_arr[i];
+            lineColor = InpHTFSupertrendDownColor;
+        }
+
+        // Check if trend changed
+        if(i < maxBars - 2 && htfTrend_arr[i] != htfTrend_arr[i + 1])
+        {
+            // Trend changed - draw to current point
+            string objName = htfStLinePrefix + IntegerToString(i) + "_change";
+            if(ObjectCreate(0, objName, OBJ_TREND, 0, time1, price1, time2, price2))
+            {
+                ObjectSetInteger(0, objName, OBJPROP_COLOR, lineColor);
+                ObjectSetInteger(0, objName, OBJPROP_WIDTH, InpHTFSupertrendWidth);
+                ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+                ObjectSetInteger(0, objName, OBJPROP_BACK, true);  // HTF im Hintergrund
+            }
+        }
+        else if(htfTrend_arr[i] == htfTrend_arr[i + 1])
+        {
+            // Same trend - continue line
+            string objName = htfStLinePrefix + IntegerToString(i);
+            if(ObjectCreate(0, objName, OBJ_TREND, 0, time1, price1, time2, price2))
+            {
+                ObjectSetInteger(0, objName, OBJPROP_COLOR, lineColor);
+                ObjectSetInteger(0, objName, OBJPROP_WIDTH, InpHTFSupertrendWidth);
+                ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+                ObjectSetInteger(0, objName, OBJPROP_BACK, true);  // HTF im Hintergrund
+            }
+        }
+    }
+
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Close All Positions bei konfigurierbaren Bedingungen             |
+//+------------------------------------------------------------------+
+// Berechnet den Slow-EMA-Wert pro Bar und speichert ihn in g_emaSlowForClose.
+// Der eigentliche Preisvergleich erfolgt tick-basiert in CheckCloseAllTick().
+void CheckCloseAllConditions()
+{
+    if(InpCloseMode != CLOSE_EMA_BREAK) return;
+
+    // Slow EMA manuell berechnen – kein Handle / BarsCalculated-Problem (wie DrawEMALines)
+    int totalBars = iBars(_Symbol, InpEMATimeframe);
+    if(totalBars < 2) return;
+    int warmup = MathMax(InpEMASlow * 3, 50);
+    int copyN  = MathMin(warmup + 2, totalBars);
+
+    double cl[];
+    ArraySetAsSeries(cl, true);
+    if(CopyClose(_Symbol, InpEMATimeframe, 0, copyN, cl) < copyN) return;
+
+    double alpha = 2.0 / (InpEMASlow + 1);
+    double ema = cl[copyN - 1];           // Seed = älteste Bar
+    for(int i = copyN - 2; i >= 1; i--)  // Stopp bei Index 1 = letzte geschlossene HTF-Bar
+        ema = ema + alpha * (cl[i] - ema);
+
+    g_emaSlowForClose = ema;  // Wert speichern für Tick-Vergleich
+}
+
+// Tick-basierter EMA-Break Check: vergleicht aktuellen Preis gegen g_emaSlowForClose.
+// Läuft jeden Tick → reagiert sofort wenn Preis unter EMA fällt, nicht erst bei neuer Bar.
+void CheckCloseAllTick()
+{
+    if(InpCloseMode != CLOSE_EMA_BREAK) return;
+    if(g_emaSlowForClose <= 0.0) return;
+    if(!PositionSelect(_Symbol)) return;
+    if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) return;
+
+    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if(currentPrice < g_emaSlowForClose)
+    {
+        trade.PositionClose(_Symbol);
+        Print("[CLOSE EMA BREAK] Preis (", currentPrice, ") unter Slow EMA (", g_emaSlowForClose, ") → Long geschlossen");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update HTF Swing Structure                                       |
+//+------------------------------------------------------------------+
+void UpdateHTFSwingStructure()
+{
+    if(!InpUseHTF || !htfInitialized) return;
+
+    // Prüfe ob neue HTF Bar
+    datetime currentHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
+    if(currentHTFBarTime == lastHTFBarTime)
+        return;
+
+    lastHTFBarTime = currentHTFBarTime;
+
+    // HTF Supertrend berechnen
+    CalculateHTFSupertrend();
+
+    bool htfBuySignal = (htfTrend == 1 && htfPrevTrend == -1);
+    bool htfSellSignal = (htfTrend == -1 && htfPrevTrend == 1);
+
+    // === CLOSE ALL: Long schließen wenn HTF in Downtrend dreht ===
+    if(htfSellSignal && InpCloseMode == CLOSE_HTF_FLIP)
+    {
+        if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+        {
+            trade.PositionClose(_Symbol);
+            Print("[CLOSE HTF FLIP] HTF dreht DOWNTREND → Long Position geschlossen");
+        }
+    }
+
+    // === HTF SWING HIGH BEI WECHSEL ZU DOWNTREND ===
+    if(htfSellSignal && htfLastUptrendHigh > 0)
+    {
+        htfValidSH = htfLastUptrendHigh;
+
+        int htfBarIndex = iBarShift(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
+
+        if(InpShowSwingLabels)
+        {
+            DrawHTFSwingLabel("HTF_SH_" + IntegerToString(TimeCurrent()),
+                            htfBarIndex,
+                            htfLastUptrendHigh,
+                            "HTF H",
+                            true);
+        }
+
+        Print("HTF H Label gesetzt bei Bar ", htfBarIndex, " (Zeit: ", TimeToString(htfLastUptrendHighTime), ") auf Preis ", htfLastUptrendHigh);
+    }
+
+    // === HTF SWING LOW BEI WECHSEL ZU UPTREND ===
+    if(htfBuySignal && htfLastDowntrendLow > 0)
+    {
+        htfValidSL = htfLastDowntrendLow;
+
+        int htfBarIndex = iBarShift(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
+
+        if(InpShowSwingLabels)
+        {
+            DrawHTFSwingLabel("HTF_SL_" + IntegerToString(TimeCurrent()),
+                            htfBarIndex,
+                            htfLastDowntrendLow,
+                            "HTF L",
+                            false);
+        }
+
+        Print("HTF L Label gesetzt bei Bar ", htfBarIndex, " (Zeit: ", TimeToString(htfLastDowntrendLowTime), ") auf Preis ", htfLastDowntrendLow);
+    }
+
+    // === HTF BOS DETECTION ===
+    double htfCurrentHigh = iHigh(_Symbol, InpHTFTimeframe, 1);
+    double htfCurrentLow = iLow(_Symbol, InpHTFTimeframe, 1);
+    double htfCurrentClose = iClose(_Symbol, InpHTFTimeframe, 1);
+    double htfCurrentOpen = iOpen(_Symbol, InpHTFTimeframe, 1);
+
+    double htfBodyHigh = MathMax(htfCurrentClose, htfCurrentOpen);
+    double htfBodyLow = MathMin(htfCurrentClose, htfCurrentOpen);
+
+    // HTF BOS UP: Preis bricht über vorheriges HTF Swing High
+    if(htfValidSH > 0 && htfBodyHigh > htfValidSH)
+    {
+        htfLastBOS = "UP";
+        Print("HTF BOS UP: Preis ", htfBodyHigh, " > HTF SH ", htfValidSH);
+    }
+
+    // HTF BOS DOWN: Preis bricht unter vorheriges HTF Swing Low
+    if(htfValidSL > 0 && htfBodyLow < htfValidSL)
+    {
+        htfLastBOS = "DOWN";
+        Print("HTF BOS DOWN: Preis ", htfBodyLow, " < HTF SL ", htfValidSL);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw HTF Swing Label (in Blue)                                   |
+//+------------------------------------------------------------------+
+void DrawHTFSwingLabel(string name, int shift, double price, string text, bool isHigh)
+{
+    // WICHTIG: shift ist auf HTF-Timeframe, aber wir wollen auf CTF zeichnen!
+    // Finde die EXAKTE CTF-Kerze, die das Extrem gebildet hat
+
+    datetime htfBarTime = iTime(_Symbol, InpHTFTimeframe, shift);
+    datetime htfBarEndTime = htfBarTime + PeriodSeconds(InpHTFTimeframe);
+
+    // Finde alle CTF-Kerzen innerhalb dieser HTF-Kerze
+    int ctfStartBar = iBarShift(_Symbol, PERIOD_CURRENT, htfBarEndTime);
+    int ctfEndBar = iBarShift(_Symbol, PERIOD_CURRENT, htfBarTime);
+
+    // Suche die CTF-Kerze mit dem Extrem
+    int extremeBar = ctfEndBar;
+    double extremeValue = isHigh ? 0 : DBL_MAX;
+
+    for(int i = ctfStartBar; i <= ctfEndBar; i++)
+    {
+        if(isHigh)
+        {
+            double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+            if(high > extremeValue)
+            {
+                extremeValue = high;
+                extremeBar = i;
+            }
+        }
+        else
+        {
+            double low = iLow(_Symbol, PERIOD_CURRENT, i);
+            if(low < extremeValue)
+            {
+                extremeValue = low;
+                extremeBar = i;
+            }
+        }
+    }
+
+    // Verwende die EXAKTE CTF-Zeit für das Label
+    datetime time = iTime(_Symbol, PERIOD_CURRENT, extremeBar);
+
+    if(ObjectFind(0, name) >= 0)
+        ObjectDelete(0, name);
+
+    // Berechne Offset basierend auf ATR für bessere Sichtbarkeit
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    double offsetDistance = 0;
+
+    if(CopyBuffer(atrHandle, 0, extremeBar, 1, atr) > 0)
+        offsetDistance = atr[0] * 0.8;  // Größeren Offset für HTF Labels
+    else
+        offsetDistance = (iHigh(_Symbol, PERIOD_CURRENT, extremeBar) - iLow(_Symbol, PERIOD_CURRENT, extremeBar)) * 3;
+
+    // Preis mit Offset
+    double adjustedPrice = isHigh ? (price + offsetDistance) : (price - offsetDistance);
+
+    // HTF Labels in BLAU (größere Dreiecke)
+    color triangleColor = InpHTFSwingColor;
+
+    // GRÖßERE Dreiecke für HTF
+    double triangleSize = offsetDistance * 0.5;  // Größer als CTF
+    long htfPeriodSeconds = PeriodSeconds(InpHTFTimeframe);
+    datetime timeOffset = (datetime)(htfPeriodSeconds * 0.5);
+
+    // Dreieck-Koordinaten
+    datetime time1, time2, time3;
+    double price1, price2, price3;
+
+    if(isHigh)
+    {
+        // Dreieck zeigt nach OBEN (für High)
+        time1 = time - timeOffset;
+        price1 = adjustedPrice + triangleSize;
+
+        time2 = time + timeOffset;
+        price2 = adjustedPrice + triangleSize;
+
+        time3 = time;
+        price3 = adjustedPrice;
+    }
+    else
+    {
+        // Dreieck zeigt nach UNTEN (für Low)
+        time1 = time - timeOffset;
+        price1 = adjustedPrice - triangleSize;
+
+        time2 = time + timeOffset;
+        price2 = adjustedPrice - triangleSize;
+
+        time3 = time;
+        price3 = adjustedPrice;
+    }
+
+    if(ObjectCreate(0, name, OBJ_TRIANGLE, 0, time1, price1, time2, price2, time3, price3))
+    {
+        ObjectSetInteger(0, name, OBJPROP_COLOR, triangleColor);
+        ObjectSetInteger(0, name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, name, OBJPROP_BACK, false);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, 3);  // Dicker als CTF
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check HTF and CTF Alignment                                      |
+//+------------------------------------------------------------------+
+bool IsHTFAligned(string direction)
+{
+    if(!InpUseHTF) return true;  // Wenn HTF nicht aktiv, immer erlaubt
+
+    // Prüfe HTF-Richtung (unabhängig von RequireAlignment - für Dashboard etc.)
+    if(direction == "UP")
+        return (htfLastBOS == "UP");
+    else if(direction == "DOWN")
+        return (htfLastBOS == "DOWN");
+
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get current trading session name (UTC)                          |
+//+------------------------------------------------------------------+
+string GetSession()
+{
+    MqlDateTime gmt;
+    TimeToStruct(TimeGMT(), gmt);
+    int h = gmt.hour;
+    if(h >= 13 && h < 16) return "Overlap";
+    if(h >=  7 && h < 13) return "London";
+    if(h >= 16 && h < 21) return "NY";
+    if(h >= 21 || h <  6) return "Asia";
+    return "Off";
+}
+
+void LogTrade(string tradeType, double entryPrice, double sl, double tp,
+              bool allowDir, bool emaAllow, bool swingIntact, bool rangeWide, bool htfAlign)
+{
+    if(logFileName == "") return;
+
+    int fh = FileOpen("DTFX_Logs\\" + logFileName, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE)
+    {
+        Print("CSV Log ERROR append (Error ", GetLastError(), ")");
+        return;
+    }
+    FileSeek(fh, 0, SEEK_END);
+
+    double atrVal = 0;
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0) atrVal = atrBuf[0];
+
+    string line =
+        TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + "," +
+        "NEW," +
+        tradeType + "," +
+        GetSession() + "," +
+        DoubleToString(entryPrice, _Digits) + "," +
+        DoubleToString(sl, _Digits) + "," +
+        DoubleToString(tp, _Digits) + "," +
+        DoubleToString(validSH, _Digits) + "," +
+        DoubleToString(validSL, _Digits) + "," +
+        DoubleToString(atrVal, _Digits) + "," +
+        IntegerToString((int)allowDir) + "," +
+        IntegerToString((int)emaAllow) + "," +
+        IntegerToString((int)swingIntact) + "," +
+        IntegerToString((int)rangeWide) + "," +
+        IntegerToString((int)htfAlign) + "," +
+        DoubleToString(adxValue, _Digits) + "\r\n";
+
+    FileWriteString(fh, line);
+    FileClose(fh);
+}
+
+//+------------------------------------------------------------------+
+//| Detect trade close and log TP/SL result                         |
+//+------------------------------------------------------------------+
+void CheckTradeClose()
+{
+    static ulong   trackedTickets[];
+    static datetime trackedTimes[];
+
+    // Build list of currently open positions on this symbol
+    ulong   openTickets[];
+    datetime openTimes[];
+    int posTotal = PositionsTotal();
+    for(int i = 0; i < posTotal; i++)
+    {
+        ulong tk = PositionGetTicket(i);
+        if(!PositionSelectByTicket(tk)) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        int n = ArraySize(openTickets);
+        ArrayResize(openTickets, n + 1);
+        ArrayResize(openTimes,   n + 1);
+        openTickets[n] = tk;
+        openTimes[n]   = (datetime)PositionGetInteger(POSITION_TIME);
+    }
+
+    // Add newly opened positions to tracking
+    for(int i = 0; i < ArraySize(openTickets); i++)
+    {
+        bool found = false;
+        for(int j = 0; j < ArraySize(trackedTickets); j++)
+            if(trackedTickets[j] == openTickets[i]) { found = true; break; }
+        if(!found)
+        {
+            int n = ArraySize(trackedTickets);
+            ArrayResize(trackedTickets, n + 1);
+            ArrayResize(trackedTimes,   n + 1);
+            trackedTickets[n] = openTickets[i];
+            trackedTimes[n]   = openTimes[i];
+        }
+    }
+
+    // Find and log closed positions (ticket tracked but no longer open)
+    for(int j = ArraySize(trackedTickets) - 1; j >= 0; j--)
+    {
+        bool stillOpen = false;
+        for(int i = 0; i < ArraySize(openTickets); i++)
+            if(openTickets[i] == trackedTickets[j]) { stillOpen = true; break; }
+
+        if(!stillOpen)
+        {
+            ulong    closedTk = trackedTickets[j];
+            datetime entryTm  = trackedTimes[j];
+
+            HistorySelectByPosition(closedTk);
+
+            string result     = "UNKNOWN";
+            double closePrice = 0;
+            double entryPrice = 0;
+            double profit     = 0;
+
+            for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+            {
+                ulong dk = HistoryDealGetTicket(i);
+                if(HistoryDealGetString(dk,  DEAL_SYMBOL)  != _Symbol)        continue;
+                if(HistoryDealGetInteger(dk, DEAL_ENTRY)   != DEAL_ENTRY_OUT) continue;
+                if((ulong)HistoryDealGetInteger(dk, DEAL_POSITION_ID) != closedTk) continue;
+
+                closePrice = HistoryDealGetDouble(dk, DEAL_PRICE);
+                profit     = HistoryDealGetDouble(dk, DEAL_PROFIT);
+                ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dk, DEAL_REASON);
+
+                for(int k = 0; k < HistoryDealsTotal(); k++)
+                {
+                    ulong t2 = HistoryDealGetTicket(k);
+                    if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == closedTk &&
+                       HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                    {
+                        entryPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+                        break;
+                    }
+                }
+
+                if(reason == DEAL_REASON_TP)      result = "TP";
+                else if(reason == DEAL_REASON_SL) result = "SL";
+                else result = (profit > 0) ? "TP" : "SL";
+                break;
+            }
+
+            LogTradeResult(result, entryTm, entryPrice, closePrice, profit);
+            ArrayRemove(trackedTickets, j, 1);
+            ArrayRemove(trackedTimes,   j, 1);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Log trade close result to CSV                                    |
+//+------------------------------------------------------------------+
+void LogTradeResult(string result, datetime entryTime, double entryPrice, double closePrice, double profit)
+{
+    if(logFileName == "") return;
+
+    int fh = FileOpen("DTFX_Logs\\" + logFileName, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE) return;
+    FileSeek(fh, 0, SEEK_END);
+
+    string line =
+        TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + "," +
+        "NEW," +
+        "CLOSE," +
+        TimeToString(entryTime, TIME_DATE | TIME_MINUTES) + "," +
+        DoubleToString(entryPrice, _Digits) + "," +
+        DoubleToString(closePrice, _Digits) + "," +
+        result + "," +
+        DoubleToString(profit, 2) + "\r\n";
+
+    FileWriteString(fh, line);
+    FileClose(fh);
+}
+
+//+------------------------------------------------------------------+
