@@ -276,6 +276,51 @@ string dashboardName = "DTFX_Dashboard";
 // Hour blocking cache - O(1) lookup instead of O(5) conditional checks
 bool blockedHours[24];
 
+// iBarShift cache - reduces expensive binary search calls
+struct BarShiftCache {
+    datetime time;
+    ENUM_TIMEFRAMES timeframe;
+    int shift;
+};
+BarShiftCache barShiftCache[20];  // Cache last 20 lookups
+int barShiftCacheSize = 0;
+
+//+------------------------------------------------------------------+
+//| Cached iBarShift - O(1) lookup for repeated calls                |
+//+------------------------------------------------------------------+
+int GetBarShiftCached(string symbol, ENUM_TIMEFRAMES timeframe, datetime time)
+{
+    // Check cache first
+    for(int i = 0; i < barShiftCacheSize; i++)
+    {
+        if(barShiftCache[i].time == time && barShiftCache[i].timeframe == timeframe)
+            return barShiftCache[i].shift;
+    }
+
+    // Not in cache, calculate and store
+    int shift = iBarShift(symbol, timeframe, time);
+
+    // Add to cache (circular buffer)
+    if(barShiftCacheSize < 20)
+    {
+        barShiftCache[barShiftCacheSize].time = time;
+        barShiftCache[barShiftCacheSize].timeframe = timeframe;
+        barShiftCache[barShiftCacheSize].shift = shift;
+        barShiftCacheSize++;
+    }
+    else
+    {
+        // Cache full, replace oldest entry (FIFO)
+        for(int i = 0; i < 19; i++)
+            barShiftCache[i] = barShiftCache[i + 1];
+        barShiftCache[19].time = time;
+        barShiftCache[19].timeframe = timeframe;
+        barShiftCache[19].shift = shift;
+    }
+
+    return shift;
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
@@ -797,7 +842,7 @@ void WarmupCTFSupertrend()
                         wValidSHTime = wHighSinceLastValidLowTime;
                         if(InpShowSwingLabels)
                         {
-                            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                            int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
                             DrawSwingLabel("SH_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrRed, true);
                         }
                     }
@@ -805,7 +850,7 @@ void WarmupCTFSupertrend()
                     wValidSLTime = wLowSinceLastValidHighTime;
                     if(InpShowSwingLabels)
                     {
-                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                        int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
                         DrawSwingLabel("SL_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrGreen, false);
                     }
                 }
@@ -820,7 +865,7 @@ void WarmupCTFSupertrend()
                 wValidSLTime = wPendingIntermedLowTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wPendingIntermedLowTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wPendingIntermedLowTime);
                     DrawSwingLabel("SL_" + IntegerToString((int)wPendingIntermedLowTime), barIdx, wValidSL, "L", clrGreen, false);
                 }
                 wHighSinceLastValidLow = 0; wHighSinceLastValidLowTime = 0;
@@ -851,7 +896,7 @@ void WarmupCTFSupertrend()
                         wValidSLTime = wLowSinceLastValidHighTime;
                         if(InpShowSwingLabels)
                         {
-                            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                            int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
                             DrawSwingLabel("SL_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrGreen, false);
                         }
                     }
@@ -859,7 +904,7 @@ void WarmupCTFSupertrend()
                     wValidSHTime = wHighSinceLastValidLowTime;
                     if(InpShowSwingLabels)
                     {
-                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                        int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
                         DrawSwingLabel("SH_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrRed, true);
                     }
                 }
@@ -874,7 +919,7 @@ void WarmupCTFSupertrend()
                 wValidSHTime = wPendingIntermedHighTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wPendingIntermedHighTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wPendingIntermedHighTime);
                     DrawSwingLabel("SH_" + IntegerToString((int)wPendingIntermedHighTime), barIdx, wValidSH, "H", clrRed, true);
                 }
                 wLowSinceLastValidHigh = 0; wLowSinceLastValidHighTime = 0;
@@ -912,7 +957,7 @@ void WarmupCTFSupertrend()
                 wValidSHTime = lastUptrendHighTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
                     DrawSwingLabel("SH_" + IntegerToString((int)lastUptrendHighTime), barIdx, lastUptrendHigh, "H", clrRed, true);
                 }
                 wArm = wIsUptrend ? "PULLBACK_DOWN" : "MOVE_DOWN";
@@ -929,7 +974,7 @@ void WarmupCTFSupertrend()
                 wValidSLTime = lastDowntrendLowTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
                     DrawSwingLabel("SL_" + IntegerToString((int)lastDowntrendLowTime), barIdx, lastDowntrendLow, "L", clrGreen, false);
                 }
                 wArm = wIsDowntrend ? "PULLBACK_UP" : "MOVE_UP";
@@ -946,7 +991,7 @@ void WarmupCTFSupertrend()
                 wValidSHTime = wHighSinceLastValidLowTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wHighSinceLastValidLowTime);
                     DrawSwingLabel("SH_TO_" + IntegerToString((int)wHighSinceLastValidLowTime), barIdx, wValidSH, "H", clrDodgerBlue, true);
                 }
                 wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
@@ -963,7 +1008,7 @@ void WarmupCTFSupertrend()
                 wValidSLTime = wLowSinceLastValidHighTime;
                 if(InpShowSwingLabels)
                 {
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, wLowSinceLastValidHighTime);
                     DrawSwingLabel("SL_TO_" + IntegerToString((int)wLowSinceLastValidHighTime), barIdx, wValidSL, "L", clrDodgerBlue, false);
                 }
                 wBarsSinceLastValidSwing = 0; wTimeoutPending = false;
@@ -991,9 +1036,9 @@ void WarmupCTFSupertrend()
     lastBOS     = wLastBOS;
     bosOccurredInCurrentArm = wBosInArm;
     validSH     = wValidSH;
-    validSHBar  = (wValidSHTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSHTime) : -1;
+    validSHBar  = (wValidSHTime > 0) ? GetBarShiftCached(_Symbol, PERIOD_CURRENT, wValidSHTime) : -1;
     validSL     = wValidSL;
-    validSLBar  = (wValidSLTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSLTime) : -1;
+    validSLBar  = (wValidSLTime > 0) ? GetBarShiftCached(_Symbol, PERIOD_CURRENT, wValidSLTime) : -1;
 
     // === Extreme tracking State übertragen ===
     highSinceLastValidLow     = wHighSinceLastValidLow;
@@ -1125,7 +1170,7 @@ void WarmupHTFSupertrend()
                         wSH = htfLastUptrendHigh;
                         if(InpShowSwingLabels)
                         {
-                            int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
+                            int htfBarIdx = GetBarShiftCached(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
                             DrawHTFSwingLabel("HTF_SH_" + IntegerToString((int)tm[i]), htfBarIdx, htfLastUptrendHigh, "HTF H", true);
                         }
                     }
@@ -1140,7 +1185,7 @@ void WarmupHTFSupertrend()
                         wSL = htfLastDowntrendLow;
                         if(InpShowSwingLabels)
                         {
-                            int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
+                            int htfBarIdx = GetBarShiftCached(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
                             DrawHTFSwingLabel("HTF_SL_" + IntegerToString((int)tm[i]), htfBarIdx, htfLastDowntrendLow, "HTF L", false);
                         }
                     }
@@ -1723,14 +1768,14 @@ void UpdateSwingStructure()
                 if(lastPlacedSwingType == "LOW" && highSinceLastValidLow > 0)
                 {
                     validSH = highSinceLastValidLow;
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
                     validSHBar = barIdx;
                     if(InpShowSwingLabels)
                         DrawSwingLabel("SH_" + IntegerToString((int)highSinceLastValidLowTime), barIdx, validSH, "H", clrRed, true);
                 }
                 // Place LOW at lowest point since last valid HIGH
                 validSL = lowSinceLastValidHigh;
-                int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+                int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
                 validSLBar = barIdx;
                 if(InpShowSwingLabels)
                     DrawSwingLabel("SL_" + IntegerToString((int)lowSinceLastValidHighTime), barIdx, validSL, "L", clrGreen, false);
@@ -1749,7 +1794,7 @@ void UpdateSwingStructure()
         else if(!wasAlreadyUptrend && lastPlacedSwingWasTimeout && lastPlacedSwingType == "HIGH" && pendingIntermedLow > 0)
         {
             validSL = pendingIntermedLow;
-            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, pendingIntermedLowTime);
+            int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, pendingIntermedLowTime);
             validSLBar = barIdx;
             if(InpShowSwingLabels)
                 DrawSwingLabel("SL_" + IntegerToString((int)pendingIntermedLowTime), barIdx, validSL, "L", clrGreen, false);
@@ -1788,14 +1833,14 @@ void UpdateSwingStructure()
                 if(lastPlacedSwingType == "HIGH" && lowSinceLastValidHigh > 0)
                 {
                     validSL = lowSinceLastValidHigh;
-                    int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+                    int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
                     validSLBar = barIdx;
                     if(InpShowSwingLabels)
                         DrawSwingLabel("SL_" + IntegerToString((int)lowSinceLastValidHighTime), barIdx, validSL, "L", clrGreen, false);
                 }
                 // Place HIGH at highest point since last valid LOW
                 validSH = highSinceLastValidLow;
-                int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+                int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
                 validSHBar = barIdx;
                 if(InpShowSwingLabels)
                     DrawSwingLabel("SH_" + IntegerToString((int)highSinceLastValidLowTime), barIdx, validSH, "H", clrRed, true);
@@ -1814,7 +1859,7 @@ void UpdateSwingStructure()
         else if(!wasAlreadyDowntrend && lastPlacedSwingWasTimeout && lastPlacedSwingType == "LOW" && pendingIntermedHigh > 0)
         {
             validSH = pendingIntermedHigh;
-            int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, pendingIntermedHighTime);
+            int barIdx = GetBarShiftCached(_Symbol, PERIOD_CURRENT, pendingIntermedHighTime);
             validSHBar = barIdx;
             if(InpShowSwingLabels)
                 DrawSwingLabel("SH_" + IntegerToString((int)pendingIntermedHighTime), barIdx, validSH, "H", clrRed, true);
@@ -1873,7 +1918,7 @@ void UpdateSupertrendCandidates()
     if(detectedSTSellSignal)
     {
         validSH = lastUptrendHigh;
-        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
+        int barIndex = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lastUptrendHighTime);
         validSHBar = barIndex;
 
         if(InpShowSwingLabels)
@@ -1903,7 +1948,7 @@ void UpdateSupertrendCandidates()
     if(detectedSTBuySignal)
     {
         validSL = lastDowntrendLow;
-        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
+        int barIndex = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lastDowntrendLowTime);
         validSLBar = barIndex;
 
         if(InpShowSwingLabels)
@@ -1933,7 +1978,7 @@ void UpdateSupertrendCandidates()
     if(detectedTimeoutHigh)
     {
         validSH = highSinceLastValidLow;
-        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
+        int barIndex = GetBarShiftCached(_Symbol, PERIOD_CURRENT, highSinceLastValidLowTime);
         validSHBar = barIndex;
 
         if(InpShowSwingLabels)
@@ -1985,7 +2030,7 @@ void UpdateSupertrendCandidates()
     if(detectedTimeoutLow)
     {
         validSL = lowSinceLastValidHigh;
-        int barIndex = iBarShift(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
+        int barIndex = GetBarShiftCached(_Symbol, PERIOD_CURRENT, lowSinceLastValidHighTime);
         validSLBar = barIndex;
 
         if(InpShowSwingLabels)
@@ -3181,7 +3226,7 @@ void UpdateHTFSwingStructure()
     {
         htfValidSH = htfLastUptrendHigh;
 
-        int htfBarIndex = iBarShift(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
+        int htfBarIndex = GetBarShiftCached(_Symbol, InpHTFTimeframe, htfLastUptrendHighTime);
 
         if(InpShowSwingLabels)
         {
@@ -3200,7 +3245,7 @@ void UpdateHTFSwingStructure()
     {
         htfValidSL = htfLastDowntrendLow;
 
-        int htfBarIndex = iBarShift(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
+        int htfBarIndex = GetBarShiftCached(_Symbol, InpHTFTimeframe, htfLastDowntrendLowTime);
 
         if(InpShowSwingLabels)
         {
@@ -3250,8 +3295,8 @@ void DrawHTFSwingLabel(string name, int shift, double price, string text, bool i
     datetime htfBarEndTime = htfBarTime + PeriodSeconds(InpHTFTimeframe);
 
     // Finde alle CTF-Kerzen innerhalb dieser HTF-Kerze
-    int ctfStartBar = iBarShift(_Symbol, PERIOD_CURRENT, htfBarEndTime);
-    int ctfEndBar = iBarShift(_Symbol, PERIOD_CURRENT, htfBarTime);
+    int ctfStartBar = GetBarShiftCached(_Symbol, PERIOD_CURRENT, htfBarEndTime);
+    int ctfEndBar = GetBarShiftCached(_Symbol, PERIOD_CURRENT, htfBarTime);
 
     // Suche die CTF-Kerze mit dem Extrem
     int extremeBar = ctfEndBar;
