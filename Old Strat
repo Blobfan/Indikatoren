@@ -1,0 +1,2380 @@
+//+------------------------------------------------------------------+
+//|                                              OLDStrategy.mq5     |
+//|                       DTFX Structure Swings + Supertrend EA      |
+//|                                                                  |
+//| FIXES v2.03 (gegenüber v2.02):                                   |
+//|                                                                  |
+//| FIX A – DeleteAllObjects() zu generische Prefix-Prüfung:        |
+//|   "SH_" und "SL_" matchten MT5-interne Chart-Objekte.           |
+//|   Nur noch "DTFX_" Prefix wird geprüft – deckt alle EA-Objekte  |
+//|   ab ohne fremde Objekte zu löschen.                             |
+//|                                                                  |
+//| FIX B – PositionClose vor neuem Trade: Schutz gegen             |
+//|   Datenlücken/Tick-Anomalien die zu extremen Verlusten führen.  |
+//|   Vor dem Schließen einer Gegenposition wird der aktuelle        |
+//|   Profit geprüft. Liegt er unter InpMaxCounterLoss wird die     |
+//|   Position NICHT geschlossen (Schutz vor Kurssprüngen).         |
+//|                                                                  |
+//| FIX C – Version String korrigiert (war noch "v2.01" im Print)   |
+//+------------------------------------------------------------------+
+#property copyright "DTFX"
+#property link      ""
+#property version   "2.03"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//+==================================================================+
+//| SECTION 1: CUSTOM ENUMS                                          |
+//+==================================================================+
+
+enum ENUM_EMA_FILTER_MODE
+{
+    EMA_FILTER_DISABLED  = 0,
+    EMA_FILTER_UNDER_EMA = 1,
+    EMA_FILTER_CROSSOVER = 2
+};
+
+enum ENUM_ARM_STATE
+{
+    ARM_UNDECIDED     = 0,
+    ARM_MOVE_UP       = 1,
+    ARM_MOVE_DOWN     = 2,
+    ARM_PULLBACK_UP   = 3,
+    ARM_PULLBACK_DOWN = 4
+};
+
+enum ENUM_BOS_DIR
+{
+    BOS_NONE = 0,
+    BOS_UP   = 1,
+    BOS_DOWN = 2
+};
+
+enum ENUM_SCALING_METHOD
+{
+    SCALING_SUPERTREND  = 0,
+    SCALING_VALID_SWING = 1,
+};
+
+//+==================================================================+
+//| SECTION 2: INPUT PARAMETERS                                      |
+//+==================================================================+
+
+input group "=== Swing Structure ==="
+input int    InpWarmupBars           = 500;
+input bool   InpShowSwingLabels      = true;
+
+input group "=== Supertrend ==="
+input int    InpSTperiod             = 12;
+input double InpSTmultiplier         = 5.0;
+input bool   InpShowSupertrendLines  = true;
+input int    InpSupertrendWidth      = 2;
+
+input group "=== EMA Settings ==="
+input int    InpEMAFast              = 21;
+input int    InpEMASlow              = 120;
+input bool   InpShowEMALines         = true;
+input color  InpEMAFastColor         = clrYellow;
+input color  InpEMASlowColor         = clrOrange;
+input int    InpEMAWidth             = 2;
+
+input group "=== EMA Filter ==="
+input ENUM_EMA_FILTER_MODE InpEMAFilterMode = EMA_FILTER_UNDER_EMA;
+
+input group "=== Trade Management ==="
+input bool   InpEnableTrade          = true;
+input double InpLotSize              = 0.1;
+input bool   InpUseFixedRRR         = false;
+input double InpRiskRewardRatio      = 2.0;
+input bool   InpAllowLongTrades      = true;
+input bool   InpAllowShortTrades     = true;
+
+// FIX B: Maximaler Verlust einer Gegenposition bevor sie geschlossen wird
+input group "=== Counter-Position Protection ==="
+input double InpMaxCounterLoss       = -300.0; // Konto-Währung; z.B. -300 = max $300 Verlust
+
+input group "=== Breakeven & Scaling SL ==="
+input bool   InpUseBreakeven         = true;
+input double InpBreakevenR           = 1.0;
+input bool   InpUseTrailingSL        = false;
+input ENUM_SCALING_METHOD InpScalingMethod = SCALING_SUPERTREND;
+input bool   InpUsePartialClose      = false;
+input double InpPartialClosePercent  = 50.0;
+
+input group "=== HTF (Higher Timeframe) ==="
+input bool   InpUseHTF               = true;
+input ENUM_TIMEFRAMES InpHTFTimeframe = PERIOD_H1;
+input bool   InpRequireHTFAlignment  = true;
+input color  InpHTFSwingColor        = clrDodgerBlue;
+input bool   InpShowHTFSupertrendLines = true;
+input color  InpHTFSupertrendUpColor   = clrDodgerBlue;
+input color  InpHTFSupertrendDownColor = clrMagenta;
+input int    InpHTFSupertrendWidth   = 3;
+
+input group "=== ADX Filter ==="
+input bool   InpUseADXFilter         = true;
+input bool   InpADXTradeFilter       = true;
+input ENUM_TIMEFRAMES InpADXTimeframe = PERIOD_CURRENT;
+input int    InpADXPeriod            = 14;
+input int    InpADXSmoothing         = 14;
+input int    InpADXSmoothing2        = 5;
+input double InpADXMinimum           = 25.0;
+input double InpADXMaximum           = 35.0;
+
+input group "=== Risk Management ==="
+input double InpStopLossPoints       = 0;
+input double InpTakeProfitPoints     = 0;
+
+input group "=== Session Filter ==="
+input bool   InpUseSessionFilter     = true;
+input bool   InpEnableLondon         = true;
+input int    InpLondonStartHour      = 7;
+input int    InpLondonEndHour        = 16;
+input bool   InpEnableNY             = true;
+input int    InpNYStartHour          = 13;
+input int    InpNYEndHour            = 22;
+input bool   InpEnableAsia           = false;
+input int    InpAsiaStartHour        = 21;
+input int    InpAsiaEndHour          = 6;
+
+input group "=== Stunden Sperren ==="
+input int    InpBlockHour1           = -1;
+input int    InpBlockHour2           = -1;
+input int    InpBlockHour3           = -1;
+input int    InpBlockHour4           = -1;
+input int    InpBlockHour5           = -1;
+
+input group "=== Display Settings ==="
+input bool   InpShowDashboard        = true;
+input int    InpDashboardX           = 20;
+input int    InpDashboardY           = 20;
+input color  InpDashboardBgColor     = clrDarkSlateGray;
+input color  InpDashboardTextColor   = clrWhite;
+
+input group "=== Consolidation Zones ==="
+input bool   InpShowConsolidation    = true;
+input color  InpConsolColor          = clrWhite;
+input int    InpConsolTransparency   = 95;
+input int    InpConsolBorderWidth    = 1;
+input double InpConsolBufferPct      = 0.0;
+
+input group "=== Debug ==="
+input bool   InpDebugLog             = false;
+
+//+==================================================================+
+//| SECTION 3: DATA STRUCTURES                                       |
+//+==================================================================+
+
+struct TradeState
+{
+    double entryPrice;
+    double targetTP;
+    double stopLoss;
+    double initialRisk;
+    bool   active;
+    bool   beTriggered;
+    bool   tpTriggered;
+    bool   isLong;
+    bool   partialClosed;
+
+    void Reset()
+    {
+        entryPrice    = 0;
+        targetTP      = 0;
+        stopLoss      = 0;
+        initialRisk   = 0;
+        active        = false;
+        beTriggered   = false;
+        tpTriggered   = false;
+        isLong        = false;
+        partialClosed = false;
+    }
+};
+
+struct STExtremes
+{
+    double   currentHigh;
+    datetime currentHighTime;
+    double   currentLow;
+    datetime currentLowTime;
+    double   lastHigh;
+    datetime lastHighTime;
+    double   lastLow;
+    datetime lastLowTime;
+
+    void Reset()
+    {
+        currentHigh = 0; currentHighTime = 0;
+        currentLow  = 0; currentLowTime  = 0;
+        lastHigh    = 0; lastHighTime    = 0;
+        lastLow     = 0; lastLowTime     = 0;
+    }
+};
+
+struct ConsolState
+{
+    bool     active;
+    datetime startTime;
+    double   rangeHigh;
+    double   rangeLow;
+    double   bufferedHigh;
+    double   bufferedLow;
+    string   boxName;
+
+    void Reset()
+    {
+        active        = false;
+        startTime     = 0;
+        rangeHigh     = 0;
+        rangeLow      = 0;
+        bufferedHigh  = 0;
+        bufferedLow   = 0;
+        boxName       = "";
+    }
+};
+
+//+==================================================================+
+//| SECTION 4: GLOBAL STATE                                          |
+//+==================================================================+
+
+CTrade g_trade;
+TradeState g_pos;
+string g_logFileName = "";
+
+int g_emaFastHandle = INVALID_HANDLE;
+int g_emaSlowHandle = INVALID_HANDLE;
+int g_atrHandle     = INVALID_HANDLE;
+int g_htfAtrHandle  = INVALID_HANDLE;
+
+double         g_validSH      = 0;
+double         g_validSL      = 0;
+int            g_validSHBar   = 0;
+int            g_validSLBar   = 0;
+bool           g_initialized  = false;
+bool           g_isUptrend    = false;
+bool           g_isDowntrend  = false;
+ENUM_BOS_DIR   g_bosDir       = BOS_NONE;
+ENUM_ARM_STATE g_arm          = ARM_UNDECIDED;
+ENUM_ARM_STATE g_prevArm      = ARM_UNDECIDED;
+bool           g_bosInArm     = false;
+
+int    g_stTrend     = 1;
+int    g_stPrevTrend = 1;
+double g_stPrevUp    = 0;
+double g_stPrevDn    = 0;
+
+STExtremes g_stExtr;
+
+bool g_emaBelowSlow    = false;
+bool g_emaAboveSlow    = false;
+bool g_emaCaptureLong  = false;
+bool g_emaCaptureShort = false;
+
+ConsolState g_consol;
+
+double       g_htfValidSH     = 0;
+double       g_htfValidSL     = 0;
+int          g_htfTrend       = 1;
+int          g_htfPrevTrend   = 1;
+double       g_htfPrevUp      = 0;
+double       g_htfPrevDn      = 0;
+ENUM_BOS_DIR g_htfBosDir      = BOS_NONE;
+bool         g_htfInitialized = false;
+datetime     g_lastHTFBarTime = 0;
+STExtremes   g_htfExtr;
+
+double g_adxRmaSmDmPlus  = -1.0;
+double g_adxRmaSmDmMinus = -1.0;
+double g_adxRmaSmTr      = -1.0;
+double g_adxRmaAdx       = -1.0;
+double g_adxPrevHigh     = 0.0;
+double g_adxPrevLow      = 0.0;
+double g_adxPrevClose    = 0.0;
+double g_adxValue        = 0.0;
+double g_adxMA           = 0.0;
+double g_adxMaBuf[];
+int    g_adxMaBufIdx     = 0;
+bool   g_adxInitialized  = false;
+datetime g_adxLastBar    = 0;
+double g_adxSeedBufDmPlus[];
+double g_adxSeedBufDmMinus[];
+double g_adxSeedBufTr[];
+int    g_adxSeedCount    = 0;
+bool   g_adxRmaSeeded    = false;
+
+const string PFX_ST      = "DTFX_ST_";
+const string PFX_HTF_ST  = "DTFX_HTF_ST_";
+const string PFX_DASH    = "DTFX_Dashboard";
+
+//+==================================================================+
+//| SECTION 5: UTILITY HELPERS                                       |
+//+==================================================================+
+
+string BosToString(ENUM_BOS_DIR dir)
+{
+    if(dir == BOS_UP)   return "UP";
+    if(dir == BOS_DOWN) return "DOWN";
+    return "NONE";
+}
+
+string ArmToString(ENUM_ARM_STATE arm)
+{
+    if(arm == ARM_MOVE_UP)       return "MOVE_UP";
+    if(arm == ARM_MOVE_DOWN)     return "MOVE_DOWN";
+    if(arm == ARM_PULLBACK_UP)   return "PULLBACK_UP";
+    if(arm == ARM_PULLBACK_DOWN) return "PULLBACK_DOWN";
+    return "UNDECIDED";
+}
+
+bool CheckSameBarEMA(bool checkBelow)
+{
+    if(InpEMAFilterMode == EMA_FILTER_DISABLED) return false;
+
+    double ema[];
+    ArraySetAsSeries(ema, true);
+    if(CopyBuffer(g_emaSlowHandle, 0, 0, 3, ema) < 3) return false;
+
+    if(InpEMAFilterMode == EMA_FILTER_UNDER_EMA)
+    {
+        if(checkBelow) return iLow(_Symbol, PERIOD_CURRENT, 1) < ema[1];
+        else           return iHigh(_Symbol, PERIOD_CURRENT, 1) > ema[1];
+    }
+    else
+    {
+        double c1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+        double c2 = iClose(_Symbol, PERIOD_CURRENT, 2);
+        if(checkBelow) return (c2 > ema[2] && c1 < ema[1]);
+        else           return (c2 < ema[2] && c1 > ema[1]);
+    }
+}
+
+void InitCSVLog()
+{
+    string ts = TimeToString(TimeCurrent(), TIME_DATE);
+    StringReplace(ts, ".", "-");
+    g_logFileName = _Symbol + "_OLD_P" + IntegerToString(PERIOD_CURRENT) + "_" + ts + ".csv";
+    FolderCreate("DTFX_Logs", FILE_COMMON);
+    int fh = FileOpen("DTFX_Logs\\" + g_logFileName, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh != INVALID_HANDLE)
+    {
+        FileWriteString(fh, "DateTime,Strategy,TradeType,Session,EntryPrice,StopLoss,TakeProfit,ValidSH,ValidSL,ATR,AllowDir,EMAAllow,SwingIntact,RangeWide,HTFAlign,ADX\r\n");
+        FileClose(fh);
+        Print("CSV Log: ", g_logFileName);
+    }
+    else
+        Print("CSV Log ERROR: ", GetLastError());
+}
+
+//+==================================================================+
+//| SECTION 6: INITIALIZATION & DEINITIALIZATION                     |
+//+==================================================================+
+
+int OnInit()
+{
+    DeleteAllObjects();
+
+    g_emaFastHandle = iMA(_Symbol, PERIOD_CURRENT, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+    g_emaSlowHandle = iMA(_Symbol, PERIOD_CURRENT, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+    g_atrHandle     = iATR(_Symbol, PERIOD_CURRENT, InpSTperiod);
+
+    if(g_emaFastHandle == INVALID_HANDLE || g_emaSlowHandle == INVALID_HANDLE || g_atrHandle == INVALID_HANDLE)
+    {
+        Print("Error creating indicator handles!");
+        return INIT_FAILED;
+    }
+
+    if(InpUseHTF)
+    {
+        g_htfAtrHandle = iATR(_Symbol, InpHTFTimeframe, InpSTperiod);
+        if(g_htfAtrHandle == INVALID_HANDLE)
+        {
+            Print("Error creating HTF ATR handle!");
+            return INIT_FAILED;
+        }
+    }
+
+    g_initialized = false;
+    g_pos.Reset();
+    g_stExtr.Reset();
+    g_htfExtr.Reset();
+    g_consol.Reset();
+
+    ArrayResize(g_adxMaBuf, MathMax(InpADXSmoothing2, 1));
+    ArrayInitialize(g_adxMaBuf, 0.0);
+    ArrayResize(g_adxSeedBufDmPlus,  InpADXPeriod);
+    ArrayResize(g_adxSeedBufDmMinus, InpADXPeriod);
+    ArrayResize(g_adxSeedBufTr,      InpADXPeriod);
+    ArrayInitialize(g_adxSeedBufDmPlus,  0.0);
+    ArrayInitialize(g_adxSeedBufDmMinus, 0.0);
+    ArrayInitialize(g_adxSeedBufTr,      0.0);
+    g_adxSeedCount   = 0;
+    g_adxRmaSeeded   = false;
+    g_adxMaBufIdx    = 0;
+    g_adxInitialized = false;
+    g_adxRmaSmDmPlus = g_adxRmaSmDmMinus = g_adxRmaSmTr = g_adxRmaAdx = 0.0;
+    g_adxPrevHigh = g_adxPrevLow = g_adxPrevClose = 0.0;
+    g_adxLastBar  = 0;
+    PreloadADX();
+
+    InitCSVLog();
+    if(InpShowDashboard) CreateDashboard();
+
+    // FIX C: Version String korrigiert
+    Print("DTFX Strategy EA v2.03 initialized");
+    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+    if(g_emaFastHandle != INVALID_HANDLE) IndicatorRelease(g_emaFastHandle);
+    if(g_emaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_emaSlowHandle);
+    if(g_atrHandle     != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if(g_htfAtrHandle  != INVALID_HANDLE) IndicatorRelease(g_htfAtrHandle);
+
+    DeleteAllObjects();
+    Print("DTFX Strategy EA deinitialized");
+}
+
+//+==================================================================+
+//| SECTION 7: MAIN LOOP                                             |
+//+==================================================================+
+
+void OnTick()
+{
+    CheckTradeClose();
+
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    if(currentBarTime == lastBarTime)
+    {
+        if(InpShowDashboard) UpdateDashboard();
+        return;
+    }
+    lastBarTime = currentBarTime;
+
+    if(!AreIndicatorsReady()) return;
+
+    if(!g_initialized && Bars(_Symbol, PERIOD_CURRENT) >= MathMin(InpWarmupBars, 34))
+        InitializeSwingStructure();
+    else if(g_initialized)
+    {
+        CalculateSupertrend();
+        UpdateSwingStructure();
+        ProcessSupertrendFlip();
+
+        if(InpShowSupertrendLines)
+            DrawSupertrendOnChart(PFX_ST, g_atrHandle, PERIOD_CURRENT, 500,
+                                 clrLime, clrRed, InpSupertrendWidth, false);
+        DrawEMALines();
+        UpdateADX();
+        CheckTradeSignals();
+        ManageOpenTrades();
+
+        if(InpShowDashboard) UpdateDashboard();
+    }
+
+    if(InpUseHTF && g_htfInitialized)
+    {
+        UpdateHTFSwingStructure();
+        if(InpShowHTFSupertrendLines)
+            DrawSupertrendOnChart(PFX_HTF_ST, g_htfAtrHandle, InpHTFTimeframe, 200,
+                                 InpHTFSupertrendUpColor, InpHTFSupertrendDownColor,
+                                 InpHTFSupertrendWidth, true);
+    }
+}
+
+bool AreIndicatorsReady()
+{
+    return BarsCalculated(g_emaFastHandle) >= 1
+        && BarsCalculated(g_emaSlowHandle) >= 1
+        && BarsCalculated(g_atrHandle)     >= 1;
+}
+
+//+==================================================================+
+//| ADX HELPERS                                                      |
+//+==================================================================+
+
+double WilderRMA(double prevRMA, double value, int length)
+{
+    return prevRMA + (value - prevRMA) / length;
+}
+
+void PreloadADX()
+{
+    int totalBars = iBars(_Symbol, InpADXTimeframe);
+    if(totalBars < 2) return;
+    int warmup   = (InpADXPeriod + InpADXSmoothing) * 3;
+    int lookback = MathMin(totalBars - 1, warmup + 2);
+
+    g_adxPrevHigh  = iHigh (_Symbol, InpADXTimeframe, lookback);
+    g_adxPrevLow   = iLow  (_Symbol, InpADXTimeframe, lookback);
+    g_adxPrevClose = iClose(_Symbol, InpADXTimeframe, lookback);
+    g_adxInitialized = true;
+
+    for(int i = lookback - 1; i >= 1; i--)
+    {
+        double h = iHigh (_Symbol, InpADXTimeframe, i);
+        double l = iLow  (_Symbol, InpADXTimeframe, i);
+        double c = iClose(_Symbol, InpADXTimeframe, i);
+        double upMove   = h - g_adxPrevHigh;
+        double downMove = g_adxPrevLow - l;
+        double plusDM   = (upMove > downMove && upMove > 0)   ? upMove   : 0.0;
+        double minusDM  = (downMove > upMove && downMove > 0) ? downMove : 0.0;
+        double tr = MathMax(h - l, MathMax(MathAbs(h - g_adxPrevClose), MathAbs(l - g_adxPrevClose)));
+        g_adxPrevHigh = h; g_adxPrevLow = l; g_adxPrevClose = c;
+
+        if(!g_adxRmaSeeded)
+        {
+            int idx = g_adxSeedCount % InpADXPeriod;
+            g_adxSeedBufDmPlus[idx]  = plusDM;
+            g_adxSeedBufDmMinus[idx] = minusDM;
+            g_adxSeedBufTr[idx]      = tr;
+            g_adxSeedCount++;
+            if(g_adxSeedCount >= InpADXPeriod)
+            {
+                double sumDmP = 0, sumDmM = 0, sumTr = 0;
+                for(int j = 0; j < InpADXPeriod; j++)
+                { sumDmP += g_adxSeedBufDmPlus[j]; sumDmM += g_adxSeedBufDmMinus[j]; sumTr += g_adxSeedBufTr[j]; }
+                g_adxRmaSmDmPlus  = sumDmP / InpADXPeriod;
+                g_adxRmaSmDmMinus = sumDmM / InpADXPeriod;
+                g_adxRmaSmTr      = sumTr  / InpADXPeriod;
+                double diP_s    = (g_adxRmaSmTr > 0) ? 100.0 * g_adxRmaSmDmPlus  / g_adxRmaSmTr : 0.0;
+                double diM_s    = (g_adxRmaSmTr > 0) ? 100.0 * g_adxRmaSmDmMinus / g_adxRmaSmTr : 0.0;
+                double diS_s    = diP_s + diM_s;
+                g_adxRmaAdx       = (diS_s == 0) ? 0.0 : 100.0 * MathAbs(diP_s - diM_s) / diS_s;
+                g_adxRmaSeeded    = true;
+            }
+        }
+        else
+        {
+            g_adxRmaSmDmPlus  = WilderRMA(g_adxRmaSmDmPlus,  plusDM,  InpADXPeriod);
+            g_adxRmaSmDmMinus = WilderRMA(g_adxRmaSmDmMinus, minusDM, InpADXPeriod);
+            g_adxRmaSmTr      = WilderRMA(g_adxRmaSmTr,      tr,      InpADXPeriod);
+            if(g_adxRmaSmTr > 0)
+            {
+                double diPlus  = 100.0 * g_adxRmaSmDmPlus  / g_adxRmaSmTr;
+                double diMinus = 100.0 * g_adxRmaSmDmMinus / g_adxRmaSmTr;
+                double diSum   = diPlus + diMinus;
+                double dx      = (diSum == 0) ? 0.0 : 100.0 * MathAbs(diPlus - diMinus) / diSum;
+                g_adxRmaAdx      = WilderRMA(g_adxRmaAdx, dx, InpADXSmoothing);
+            }
+        }
+    }
+    if(g_adxRmaSeeded)
+    {
+        g_adxValue = g_adxRmaAdx;
+        int maLen = MathMax(InpADXSmoothing2, 1);
+        ArrayResize(g_adxMaBuf, maLen);
+        ArrayInitialize(g_adxMaBuf, g_adxValue);
+        g_adxMaBufIdx = maLen;
+        g_adxMA = g_adxValue;
+    }
+    g_adxLastBar = iTime(_Symbol, InpADXTimeframe, 1);
+}
+
+void UpdateADX()
+{
+    datetime barTime = iTime(_Symbol, InpADXTimeframe, 1);
+    if(barTime == g_adxLastBar) return;
+    g_adxLastBar = barTime;
+
+    double high1  = iHigh (_Symbol, InpADXTimeframe, 1);
+    double low1   = iLow  (_Symbol, InpADXTimeframe, 1);
+    double close1 = iClose(_Symbol, InpADXTimeframe, 1);
+
+    if(!g_adxInitialized)
+    {
+        g_adxPrevHigh  = high1;
+        g_adxPrevLow   = low1;
+        g_adxPrevClose = close1;
+        g_adxInitialized = true;
+        return;
+    }
+
+    double upMove   = high1      - g_adxPrevHigh;
+    double downMove = g_adxPrevLow - low1;
+    double plusDM   = (upMove > downMove && upMove > 0)   ? upMove   : 0.0;
+    double minusDM  = (downMove > upMove && downMove > 0) ? downMove : 0.0;
+
+    double tr = MathMax(high1 - low1,
+                MathMax(MathAbs(high1 - g_adxPrevClose),
+                        MathAbs(low1  - g_adxPrevClose)));
+
+    g_adxPrevHigh  = high1;
+    g_adxPrevLow   = low1;
+    g_adxPrevClose = close1;
+
+    if(!g_adxRmaSeeded)
+    {
+        int idx = g_adxSeedCount % InpADXPeriod;
+        g_adxSeedBufDmPlus[idx]  = plusDM;
+        g_adxSeedBufDmMinus[idx] = minusDM;
+        g_adxSeedBufTr[idx]      = tr;
+        g_adxSeedCount++;
+
+        if(g_adxSeedCount >= InpADXPeriod)
+        {
+            double sumDmP = 0, sumDmM = 0, sumTr = 0;
+            for(int i = 0; i < InpADXPeriod; i++)
+            {
+                sumDmP += g_adxSeedBufDmPlus[i];
+                sumDmM += g_adxSeedBufDmMinus[i];
+                sumTr  += g_adxSeedBufTr[i];
+            }
+            g_adxRmaSmDmPlus  = sumDmP / InpADXPeriod;
+            g_adxRmaSmDmMinus = sumDmM / InpADXPeriod;
+            g_adxRmaSmTr      = sumTr  / InpADXPeriod;
+
+            double diP_s = (g_adxRmaSmTr > 0) ? 100.0 * g_adxRmaSmDmPlus  / g_adxRmaSmTr : 0.0;
+            double diM_s = (g_adxRmaSmTr > 0) ? 100.0 * g_adxRmaSmDmMinus / g_adxRmaSmTr : 0.0;
+            double diS_s = diP_s + diM_s;
+            g_adxRmaAdx = (diS_s == 0) ? 0.0 : 100.0 * MathAbs(diP_s - diM_s) / diS_s;
+
+            g_adxRmaSeeded = true;
+        }
+        g_adxValue = 0.0;
+        g_adxMA    = 0.0;
+        return;
+    }
+
+    g_adxRmaSmDmPlus  = WilderRMA(g_adxRmaSmDmPlus,  plusDM,  InpADXPeriod);
+    g_adxRmaSmDmMinus = WilderRMA(g_adxRmaSmDmMinus, minusDM, InpADXPeriod);
+    g_adxRmaSmTr      = WilderRMA(g_adxRmaSmTr,      tr,      InpADXPeriod);
+
+    if(g_adxRmaSmTr == 0) return;
+
+    double diPlus  = 100.0 * g_adxRmaSmDmPlus  / g_adxRmaSmTr;
+    double diMinus = 100.0 * g_adxRmaSmDmMinus / g_adxRmaSmTr;
+    double diSum   = diPlus + diMinus;
+    double dx      = (diSum == 0) ? 0.0 : 100.0 * MathAbs(diPlus - diMinus) / diSum;
+
+    g_adxRmaAdx = WilderRMA(g_adxRmaAdx, dx, InpADXSmoothing);
+    g_adxValue  = g_adxRmaAdx;
+
+    int maLen = MathMax(InpADXSmoothing2, 1);
+    g_adxMaBuf[g_adxMaBufIdx % maLen] = g_adxValue;
+    g_adxMaBufIdx++;
+    double sum = 0;
+    int    cnt = MathMin(g_adxMaBufIdx, maLen);
+    for(int i = 0; i < cnt; i++) sum += g_adxMaBuf[i];
+    g_adxMA = (cnt > 0) ? sum / cnt : 0.0;
+}
+
+//+==================================================================+
+//| SECTION 8: SUPERTREND CORE                                       |
+//+==================================================================+
+
+void CalculateSupertrend()
+{
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    if(CopyBuffer(g_atrHandle, 0, 0, 3, atr) < 3) return;
+
+    double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+    double close2 = iClose(_Symbol, PERIOD_CURRENT, 2);
+
+    double src = (high1 + low1) / 2.0;
+    double up  = src - InpSTmultiplier * atr[1];
+    double dn  = src + InpSTmultiplier * atr[1];
+
+    double prevUp = (g_stPrevUp > 0) ? g_stPrevUp : up;
+    double prevDn = (g_stPrevDn > 0) ? g_stPrevDn : dn;
+
+    if(close2 > prevUp) up = MathMax(up, prevUp);
+    if(close2 < prevDn) dn = MathMin(dn, prevDn);
+
+    g_stPrevUp = up;
+    g_stPrevDn = dn;
+
+    g_stPrevTrend = g_stTrend;
+    if(g_stTrend == -1 && close1 > prevDn)     g_stTrend = 1;
+    else if(g_stTrend == 1 && close1 < prevUp) g_stTrend = -1;
+
+    if(InpEMAFilterMode != EMA_FILTER_DISABLED)
+    {
+        double emaVal[];
+        ArraySetAsSeries(emaVal, true);
+        if(CopyBuffer(g_emaSlowHandle, 0, 0, 3, emaVal) >= 3)
+        {
+            double ema1 = emaVal[1];
+            double ema2 = emaVal[2];
+
+            if(InpEMAFilterMode == EMA_FILTER_UNDER_EMA)
+            {
+                if(g_arm == ARM_PULLBACK_DOWN && low1 < ema1 && !g_emaBelowSlow)
+                {
+                    g_emaBelowSlow = true;
+                    if(InpDebugLog) Print("[EMA] belowSlow=TRUE (low=", low1, " ema=", ema1, ")");
+                }
+                if(g_arm == ARM_PULLBACK_UP && high1 > ema1 && !g_emaAboveSlow)
+                {
+                    g_emaAboveSlow = true;
+                    if(InpDebugLog) Print("[EMA] aboveSlow=TRUE (high=", high1, " ema=", ema1, ")");
+                }
+            }
+            else
+            {
+                if(g_arm == ARM_PULLBACK_DOWN && close2 > ema2 && close1 < ema1 && !g_emaBelowSlow)
+                {
+                    g_emaBelowSlow = true;
+                    if(InpDebugLog) Print("[EMA] CROSSOVER belowSlow=TRUE");
+                }
+                if(g_arm == ARM_PULLBACK_UP && close2 < ema2 && close1 > ema1 && !g_emaAboveSlow)
+                {
+                    g_emaAboveSlow = true;
+                    if(InpDebugLog) Print("[EMA] CROSSOVER aboveSlow=TRUE");
+                }
+            }
+        }
+    }
+
+    if(g_stPrevTrend == 1 && (high1 > g_stExtr.currentHigh || g_stExtr.currentHigh == 0))
+    {
+        g_stExtr.currentHigh     = high1;
+        g_stExtr.currentHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+    }
+    if(g_stPrevTrend == -1 && (low1 < g_stExtr.currentLow || g_stExtr.currentLow == 0))
+    {
+        g_stExtr.currentLow     = low1;
+        g_stExtr.currentLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+    }
+
+    if(g_stTrend != g_stPrevTrend && g_stPrevTrend != 0)
+    {
+        if(g_stTrend == -1)
+        {
+            g_stExtr.lastHigh     = g_stExtr.currentHigh;
+            g_stExtr.lastHighTime = g_stExtr.currentHighTime;
+            g_stExtr.currentLow     = 0;
+            g_stExtr.currentLowTime = 0;
+            if(InpDebugLog) Print("ST→DOWN: HIGH=", g_stExtr.lastHigh, " @", TimeToString(g_stExtr.lastHighTime));
+        }
+        else
+        {
+            g_stExtr.lastLow      = g_stExtr.currentLow;
+            g_stExtr.lastLowTime  = g_stExtr.currentLowTime;
+            g_stExtr.currentHigh     = 0;
+            g_stExtr.currentHighTime = 0;
+            if(InpDebugLog) Print("ST→UP: LOW=", g_stExtr.lastLow, " @", TimeToString(g_stExtr.lastLowTime));
+        }
+    }
+}
+
+void CalculateHTFSupertrend()
+{
+    if(!InpUseHTF || g_htfAtrHandle == INVALID_HANDLE) return;
+
+    double atr[];
+    ArraySetAsSeries(atr, true);
+    if(CopyBuffer(g_htfAtrHandle, 0, 0, 3, atr) < 3) return;
+
+    double h1 = iHigh(_Symbol, InpHTFTimeframe, 1);
+    double l1 = iLow(_Symbol, InpHTFTimeframe, 1);
+    double c1 = iClose(_Symbol, InpHTFTimeframe, 1);
+    double c2 = iClose(_Symbol, InpHTFTimeframe, 2);
+
+    double src = (h1 + l1) / 2.0;
+    double up  = src - InpSTmultiplier * atr[1];
+    double dn  = src + InpSTmultiplier * atr[1];
+
+    double prevUp = (g_htfPrevUp > 0) ? g_htfPrevUp : up;
+    double prevDn = (g_htfPrevDn > 0) ? g_htfPrevDn : dn;
+
+    if(c2 > prevUp) up = MathMax(up, prevUp);
+    if(c2 < prevDn) dn = MathMin(dn, prevDn);
+
+    g_htfPrevUp = up;
+    g_htfPrevDn = dn;
+
+    g_htfPrevTrend = g_htfTrend;
+    if(g_htfTrend == -1 && c1 > prevDn)     g_htfTrend = 1;
+    else if(g_htfTrend == 1 && c1 < prevUp) g_htfTrend = -1;
+
+    if(g_htfTrend == 1 && (h1 > g_htfExtr.currentHigh || g_htfExtr.currentHigh == 0))
+    {
+        g_htfExtr.currentHigh     = h1;
+        g_htfExtr.currentHighTime = iTime(_Symbol, InpHTFTimeframe, 1);
+    }
+    if(g_htfTrend == -1 && (l1 < g_htfExtr.currentLow || g_htfExtr.currentLow == 0))
+    {
+        g_htfExtr.currentLow     = l1;
+        g_htfExtr.currentLowTime = iTime(_Symbol, InpHTFTimeframe, 1);
+    }
+
+    if(g_htfTrend != g_htfPrevTrend && g_htfPrevTrend != 0)
+    {
+        if(g_htfTrend == -1)
+        {
+            g_htfExtr.lastHigh     = g_htfExtr.currentHigh;
+            g_htfExtr.lastHighTime = g_htfExtr.currentHighTime;
+            g_htfExtr.currentLow     = 0;
+            g_htfExtr.currentLowTime = 0;
+            if(InpDebugLog) Print("HTF ST→DOWN: HIGH=", g_htfExtr.lastHigh);
+        }
+        else
+        {
+            g_htfExtr.lastLow      = g_htfExtr.currentLow;
+            g_htfExtr.lastLowTime  = g_htfExtr.currentLowTime;
+            g_htfExtr.currentHigh     = 0;
+            g_htfExtr.currentHighTime = 0;
+            if(InpDebugLog) Print("HTF ST→UP: LOW=", g_htfExtr.lastLow);
+        }
+    }
+}
+
+//+==================================================================+
+//| SECTION 8b: STARTUP WARMUP                                       |
+//+==================================================================+
+
+void RunWarmup()
+{
+    if(InpWarmupBars <= 0) return;
+    WarmupCTFSupertrend();
+    if(InpUseHTF && g_htfAtrHandle != INVALID_HANDLE)
+        WarmupHTFSupertrend();
+}
+
+void WarmupCTFSupertrend()
+{
+    int count = MathMin(InpWarmupBars + 3, Bars(_Symbol, PERIOD_CURRENT));
+    if(count < 4) return;
+
+    double atr[], hi[], lo[], cl[], op[];
+    datetime tm[];
+    ArraySetAsSeries(atr, true); ArraySetAsSeries(hi, true);
+    ArraySetAsSeries(lo,  true); ArraySetAsSeries(cl, true);
+    ArraySetAsSeries(op,  true); ArraySetAsSeries(tm, true);
+
+    if(CopyBuffer(g_atrHandle, 0, 0, count, atr) < count) return;
+    if(CopyHigh  (_Symbol, PERIOD_CURRENT, 0, count, hi ) < count) return;
+    if(CopyLow   (_Symbol, PERIOD_CURRENT, 0, count, lo ) < count) return;
+    if(CopyClose (_Symbol, PERIOD_CURRENT, 0, count, cl ) < count) return;
+    if(CopyOpen  (_Symbol, PERIOD_CURRENT, 0, count, op ) < count) return;
+    if(CopyTime  (_Symbol, PERIOD_CURRENT, 0, count, tm ) < count) return;
+
+    double prevUp = 0, prevDn = 0;
+    int    wTrend = 1;
+    g_stExtr.Reset();
+
+    int      wArm        = ARM_UNDECIDED;
+    int      wPrevArm    = ARM_UNDECIDED;
+    bool     wIsUptrend  = true;
+    bool     wIsDowntrend= false;
+    bool     wBosInArm   = false;
+    double   wValidSH    = 0,  wValidSL    = 0;
+    datetime wValidSHTime= 0,  wValidSLTime= 0;
+
+    bool     wConsolActive = false;
+    datetime wConsolStart  = 0;
+    double   wConsolHigh   = 0, wConsolLow = 0;
+
+    for(int i = count - 1; i >= 2; i--)
+    {
+        double h1     = hi[i];
+        double l1     = lo[i];
+        double c1     = cl[i];
+        double o1     = op[i];
+        double c_prev = (i + 1 < count) ? cl[i + 1] : c1;
+
+        double src = (h1 + l1) / 2.0;
+        double up  = src - InpSTmultiplier * atr[i];
+        double dn  = src + InpSTmultiplier * atr[i];
+
+        if(prevUp > 0)
+        {
+            if(c_prev > prevUp) up = MathMax(up, prevUp);
+            if(c_prev < prevDn) dn = MathMin(dn, prevDn);
+        }
+
+        int prevTrend = wTrend;
+        if(wTrend == -1 && c1 > prevDn)     wTrend = 1;
+        else if(wTrend == 1 && c1 < prevUp) wTrend = -1;
+
+        if(prevTrend == 1  && (h1 > g_stExtr.currentHigh || g_stExtr.currentHigh == 0))
+            { g_stExtr.currentHigh = h1; g_stExtr.currentHighTime = tm[i]; }
+        if(prevTrend == -1 && (l1 < g_stExtr.currentLow  || g_stExtr.currentLow  == 0))
+            { g_stExtr.currentLow  = l1; g_stExtr.currentLowTime  = tm[i]; }
+
+        if(wIsUptrend && wArm == ARM_PULLBACK_DOWN && h1 > g_stExtr.currentHigh)
+            { g_stExtr.currentHigh = h1; g_stExtr.currentHighTime = tm[i]; }
+        if(wIsDowntrend && wArm == ARM_PULLBACK_UP && l1 < g_stExtr.currentLow)
+            { g_stExtr.currentLow  = l1; g_stExtr.currentLowTime  = tm[i]; }
+
+        double bodyHi = MathMax(c1, o1);
+        double bodyLo = MathMin(c1, o1);
+        if(wValidSH > 0 && bodyHi > wValidSH && !wBosInArm)
+            { wBosInArm = true; wIsUptrend = true;  wIsDowntrend = false; }
+        if(wValidSL > 0 && bodyLo < wValidSL && !wBosInArm)
+            { wBosInArm = true; wIsUptrend = false; wIsDowntrend = true;  }
+
+        if(wConsolActive)
+        {
+            double _cRange   = wConsolHigh - wConsolLow;
+            double _cHalfBuf = _cRange * (InpConsolBufferPct / 100.0) / 2.0;
+            double buffH = wConsolHigh + _cHalfBuf;
+            double buffL = wConsolLow  - _cHalfBuf;
+            if(wBosInArm || bodyHi > buffH || bodyLo < buffL)
+            {
+                if(InpShowConsolidation)
+                {
+                    string cName = "DTFX_Consol_" + IntegerToString((int)wConsolStart);
+                    if(ObjectFind(0, cName) >= 0) ObjectDelete(0, cName);
+                    if(ObjectCreate(0, cName, OBJ_RECTANGLE, 0, wConsolStart, buffH, tm[i], buffL))
+                    {
+                        ObjectSetInteger(0, cName, OBJPROP_COLOR,  InpConsolColor);
+                        ObjectSetInteger(0, cName, OBJPROP_STYLE,  STYLE_SOLID);
+                        ObjectSetInteger(0, cName, OBJPROP_WIDTH,  InpConsolBorderWidth);
+                        ObjectSetInteger(0, cName, OBJPROP_FILL,   true);
+                        ObjectSetInteger(0, cName, OBJPROP_BACK,   true);
+                        int transparency = (int)((InpConsolTransparency / 100.0) * 255);
+                        color bgColor = InpConsolColor;
+                        long r = (bgColor & 0xFF);
+                        long g_c = ((bgColor >> 8) & 0xFF);
+                        long b = ((bgColor >> 16) & 0xFF);
+                        long alphaColor = (transparency << 24) | (b << 16) | (g_c << 8) | r;
+                        ObjectSetInteger(0, cName, OBJPROP_BGCOLOR, alphaColor);
+                    }
+                }
+                wConsolActive = false;
+            }
+        }
+
+        if(wTrend != prevTrend)
+        {
+            bool wMoveEndedWithoutBOS = false;
+            if((ENUM_ARM_STATE)wPrevArm == ARM_MOVE_UP   && wTrend == -1 && wIsUptrend)
+                wMoveEndedWithoutBOS = !wBosInArm;
+            if((ENUM_ARM_STATE)wPrevArm == ARM_MOVE_DOWN  && wTrend == 1  && wIsDowntrend)
+                wMoveEndedWithoutBOS = !wBosInArm;
+
+            if(wTrend == -1)
+            {
+                g_stExtr.lastHigh     = g_stExtr.currentHigh;
+                g_stExtr.lastHighTime = g_stExtr.currentHighTime;
+                g_stExtr.currentLow     = 0;
+                g_stExtr.currentLowTime = 0;
+                if(g_stExtr.lastHigh > 0)
+                {
+                    wValidSH     = g_stExtr.lastHigh;
+                    wValidSHTime = g_stExtr.lastHighTime;
+                    if(InpShowSwingLabels)
+                    {
+                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, g_stExtr.lastHighTime);
+                        DrawCTFSwingLabel("SH_" + IntegerToString((int)g_stExtr.lastHighTime), barIdx, g_stExtr.lastHigh, true);
+                    }
+                }
+                wArm = (wIsUptrend) ? ARM_PULLBACK_DOWN : ARM_MOVE_DOWN;
+            }
+            else
+            {
+                g_stExtr.lastLow     = g_stExtr.currentLow;
+                g_stExtr.lastLowTime = g_stExtr.currentLowTime;
+                g_stExtr.currentHigh     = 0;
+                g_stExtr.currentHighTime = 0;
+                if(g_stExtr.lastLow > 0)
+                {
+                    wValidSL     = g_stExtr.lastLow;
+                    wValidSLTime = g_stExtr.lastLowTime;
+                    if(InpShowSwingLabels)
+                    {
+                        int barIdx = iBarShift(_Symbol, PERIOD_CURRENT, g_stExtr.lastLowTime);
+                        DrawCTFSwingLabel("SL_" + IntegerToString((int)g_stExtr.lastLowTime), barIdx, g_stExtr.lastLow, false);
+                    }
+                }
+                wArm = (wIsDowntrend) ? ARM_PULLBACK_UP : ARM_MOVE_UP;
+            }
+            wBosInArm = false;
+
+            if(wMoveEndedWithoutBOS && !wConsolActive && InpShowConsolidation
+               && wValidSH > 0 && wValidSL > 0)
+            {
+                wConsolActive = true;
+                wConsolStart  = (datetime)MathMin((long)wValidSHTime, (long)wValidSLTime);
+                wConsolHigh   = wValidSH;
+                wConsolLow    = wValidSL;
+            }
+
+            wPrevArm = wArm;
+        }
+
+        prevUp = up;
+        prevDn = dn;
+    }
+
+    g_stTrend     = wTrend;
+    g_stPrevTrend = wTrend;
+    g_stPrevUp    = prevUp;
+    g_stPrevDn    = prevDn;
+
+    g_isUptrend   = wIsUptrend;
+    g_isDowntrend = wIsDowntrend;
+    g_bosInArm    = wBosInArm;
+    g_arm         = (ENUM_ARM_STATE)wArm;
+    g_prevArm     = (ENUM_ARM_STATE)wPrevArm;
+    g_validSH     = wValidSH;
+    g_validSHBar  = (wValidSHTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSHTime) : -1;
+    g_validSL     = wValidSL;
+    g_validSLBar  = (wValidSLTime > 0) ? iBarShift(_Symbol, PERIOD_CURRENT, wValidSLTime) : -1;
+
+    if(wConsolActive)
+    {
+        g_consol.active    = true;
+        g_consol.startTime = wConsolStart;
+        g_consol.rangeHigh = wConsolHigh;
+        g_consol.rangeLow  = wConsolLow;
+        double _cRange     = wConsolHigh - wConsolLow;
+        double _cHalfBuf   = _cRange * (InpConsolBufferPct / 100.0) / 2.0;
+        g_consol.bufferedHigh = wConsolHigh + _cHalfBuf;
+        g_consol.bufferedLow  = wConsolLow  - _cHalfBuf;
+    }
+
+    Print("CTF Warmup (", InpWarmupBars, " Bars): trend=", wTrend,
+          " isUp=", wIsUptrend, " arm=", ArmToString((ENUM_ARM_STATE)wArm),
+          " lastHigh=", g_stExtr.lastHigh, " lastLow=", g_stExtr.lastLow);
+}
+
+void WarmupHTFSupertrend()
+{
+    int count = MathMin(InpWarmupBars + 3, iBars(_Symbol, InpHTFTimeframe));
+    if(count < 4) return;
+
+    double atr[], hi[], lo[], cl[], op[];
+    datetime tm[];
+    ArraySetAsSeries(atr, true); ArraySetAsSeries(hi, true);
+    ArraySetAsSeries(lo,  true); ArraySetAsSeries(cl, true);
+    ArraySetAsSeries(op,  true); ArraySetAsSeries(tm, true);
+
+    if(CopyBuffer(g_htfAtrHandle, 0, 0, count, atr) < count) return;
+    if(CopyHigh  (_Symbol, InpHTFTimeframe, 0, count, hi ) < count) return;
+    if(CopyLow   (_Symbol, InpHTFTimeframe, 0, count, lo ) < count) return;
+    if(CopyClose (_Symbol, InpHTFTimeframe, 0, count, cl ) < count) return;
+    if(CopyOpen  (_Symbol, InpHTFTimeframe, 0, count, op ) < count) return;
+    if(CopyTime  (_Symbol, InpHTFTimeframe, 0, count, tm ) < count) return;
+
+    double prevUp = 0, prevDn = 0;
+    int    wTrend = 1;
+    g_htfExtr.Reset();
+
+    double htfSH = 0, htfSL = DBL_MAX;
+    int    initWindow = MathMin(34, count);
+    for(int j = count - 1; j >= count - initWindow; j--)
+    {
+        if(hi[j] > htfSH) htfSH = hi[j];
+        if(lo[j] < htfSL) htfSL = lo[j];
+    }
+    if(htfSL == DBL_MAX) htfSL = 0;
+
+    ENUM_BOS_DIR htfBos = BOS_NONE;
+
+    for(int i = count - 1; i >= 2; i--)
+    {
+        double h1     = hi[i];
+        double l1     = lo[i];
+        double c1     = cl[i];
+        double o1     = op[i];
+        double c_prev = (i + 1 < count) ? cl[i + 1] : c1;
+
+        double src = (h1 + l1) / 2.0;
+        double up  = src - InpSTmultiplier * atr[i];
+        double dn  = src + InpSTmultiplier * atr[i];
+        if(prevUp > 0)
+        {
+            if(c_prev > prevUp) up = MathMax(up, prevUp);
+            if(c_prev < prevDn) dn = MathMin(dn, prevDn);
+        }
+
+        int prevTrend = wTrend;
+        if(wTrend == -1 && c1 > prevDn)     wTrend = 1;
+        else if(wTrend == 1 && c1 < prevUp) wTrend = -1;
+
+        if(wTrend == 1  && (h1 > g_htfExtr.currentHigh || g_htfExtr.currentHigh == 0))
+            { g_htfExtr.currentHigh = h1; g_htfExtr.currentHighTime = tm[i]; }
+        if(wTrend == -1 && (l1 < g_htfExtr.currentLow  || g_htfExtr.currentLow  == 0))
+            { g_htfExtr.currentLow  = l1; g_htfExtr.currentLowTime  = tm[i]; }
+
+        if(wTrend != prevTrend)
+        {
+            if(wTrend == -1)
+            {
+                g_htfExtr.lastHigh     = g_htfExtr.currentHigh;
+                g_htfExtr.lastHighTime = g_htfExtr.currentHighTime;
+                g_htfExtr.currentLow     = 0;
+                g_htfExtr.currentLowTime = 0;
+                if(g_htfExtr.lastHigh > 0)
+                {
+                    htfSH = g_htfExtr.lastHigh;
+                    if(InpShowSwingLabels)
+                    {
+                        int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, g_htfExtr.lastHighTime);
+                        DrawHTFSwingLabel("HTF_SH_" + IntegerToString((int)tm[i]), htfBarIdx, g_htfExtr.lastHigh, true);
+                    }
+                }
+            }
+            else
+            {
+                g_htfExtr.lastLow     = g_htfExtr.currentLow;
+                g_htfExtr.lastLowTime = g_htfExtr.currentLowTime;
+                g_htfExtr.currentHigh     = 0;
+                g_htfExtr.currentHighTime = 0;
+                if(g_htfExtr.lastLow > 0)
+                {
+                    htfSL = g_htfExtr.lastLow;
+                    if(InpShowSwingLabels)
+                    {
+                        int htfBarIdx = iBarShift(_Symbol, InpHTFTimeframe, g_htfExtr.lastLowTime);
+                        DrawHTFSwingLabel("HTF_SL_" + IntegerToString((int)tm[i]), htfBarIdx, g_htfExtr.lastLow, false);
+                    }
+                }
+            }
+        }
+
+        double bodyHi = MathMax(c1, o1);
+        double bodyLo = MathMin(c1, o1);
+
+        if(htfSH > 0 && bodyHi > htfSH)
+        {
+            htfBos = BOS_UP;
+            htfSH  = h1;
+        }
+        if(htfSL > 0 && bodyLo < htfSL)
+        {
+            htfBos = BOS_DOWN;
+            htfSL  = l1;
+        }
+
+        prevUp = up;
+        prevDn = dn;
+    }
+
+    g_htfTrend       = wTrend;
+    g_htfPrevTrend   = wTrend;
+    g_htfPrevUp      = prevUp;
+    g_htfPrevDn      = prevDn;
+    g_htfValidSH     = htfSH;
+    g_htfValidSL     = (htfSL == DBL_MAX) ? 0 : htfSL;
+    g_htfBosDir      = htfBos;
+    g_htfInitialized = true;
+    g_lastHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
+
+    Print("HTF Warmup (", InpWarmupBars, " Bars): trend=", wTrend,
+          " BOS=", BosToString(htfBos), " SH=", htfSH, " SL=", g_htfValidSL);
+}
+
+//+==================================================================+
+//| SECTION 9: SWING STRUCTURE                                       |
+//+==================================================================+
+
+void InitializeSwingStructure()
+{
+    int bars = Bars(_Symbol, PERIOD_CURRENT);
+    if(bars < 34) return;
+
+    RunWarmup();
+
+    if(InpWarmupBars <= 0)
+    {
+        g_isUptrend   = (iHigh(_Symbol, PERIOD_CURRENT, 1) > iHigh(_Symbol, PERIOD_CURRENT, 2));
+        g_isDowntrend = !g_isUptrend;
+        g_bosInArm    = false;
+        g_arm         = g_isUptrend ? ARM_MOVE_UP : ARM_MOVE_DOWN;
+        int lookback  = 34;
+        int highestBar = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, lookback, 1);
+        g_validSH     = iHigh(_Symbol, PERIOD_CURRENT, highestBar);
+        g_validSHBar  = highestBar;
+        int lowestBar  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, lookback, 1);
+        g_validSL     = iLow(_Symbol, PERIOD_CURRENT, lowestBar);
+        g_validSLBar  = lowestBar;
+    }
+
+    g_initialized = true;
+    g_bosDir      = (g_stTrend == 1) ? BOS_UP : BOS_DOWN;
+
+    CalculateSupertrend();
+    g_bosDir = (g_stTrend == 1) ? BOS_UP : BOS_DOWN;
+
+    if(!g_htfInitialized)
+        InitializeHTFSwingStructure();
+
+    if(InpShowSupertrendLines)
+        DrawSupertrendOnChart(PFX_ST, g_atrHandle, PERIOD_CURRENT, 500,
+                             clrLime, clrRed, InpSupertrendWidth, false);
+    DrawEMALines();
+
+    if(g_consol.active)
+        DrawConsolidationBox();
+
+    if(g_stTrend != g_stPrevTrend)
+        ProcessSupertrendFlip();
+
+    Print("Swing init v2.03: SH=", g_validSH, " SL=", g_validSL,
+          " trend=", (g_isUptrend ? "UP" : "DOWN"),
+          " bosDir=", BosToString(g_bosDir),
+          " warmup=", (InpWarmupBars > 0 ? "ON" : "OFF"));
+}
+
+void UpdateSwingStructure()
+{
+    double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+    double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+    double bodyHi = MathMax(close1, open1);
+    double bodyLo = MathMin(close1, open1);
+
+    if(g_isUptrend && g_arm == ARM_PULLBACK_DOWN && high1 > g_stExtr.currentHigh)
+    {
+        g_stExtr.currentHigh     = high1;
+        g_stExtr.currentHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+    }
+    if(g_isDowntrend && g_arm == ARM_PULLBACK_UP && low1 < g_stExtr.currentLow)
+    {
+        g_stExtr.currentLow     = low1;
+        g_stExtr.currentLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+    }
+
+    if(g_validSH > 0 && bodyHi > g_validSH && !g_bosInArm)
+    {
+        g_bosInArm    = true;
+        g_bosDir      = BOS_UP;
+        g_isUptrend   = true;
+        g_isDowntrend = false;
+    }
+    if(g_validSL > 0 && bodyLo < g_validSL && !g_bosInArm)
+    {
+        g_bosInArm    = true;
+        g_bosDir      = BOS_DOWN;
+        g_isUptrend   = false;
+        g_isDowntrend = true;
+    }
+}
+
+//+==================================================================+
+//| SECTION 10: SUPERTREND ARM MANAGEMENT                            |
+//+==================================================================+
+
+void ProcessSupertrendFlip()
+{
+    bool buySignal  = (g_stTrend == 1  && g_stPrevTrend == -1);
+    bool sellSignal = (g_stTrend == -1 && g_stPrevTrend == 1);
+
+    bool moveArmEndedWithoutBOS = false;
+    if(g_prevArm == ARM_MOVE_UP && sellSignal && g_isUptrend)
+        moveArmEndedWithoutBOS = !g_bosInArm;
+    if(g_prevArm == ARM_MOVE_DOWN && buySignal && g_isDowntrend)
+        moveArmEndedWithoutBOS = !g_bosInArm;
+
+    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+    double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+    double bodyHi = MathMax(close1, open1);
+    double bodyLo = MathMin(close1, open1);
+
+    bool bosUp   = (g_validSH > 0 && bodyHi > g_validSH && !g_bosInArm);
+    bool bosDown = (g_validSL > 0 && bodyLo < g_validSL && !g_bosInArm);
+
+    bool pullbackBOSDuringConsol = false;
+    if(g_consol.active && (bosUp || bosDown))
+    {
+        if((sellSignal && g_isUptrend) || (buySignal && g_isDowntrend))
+            pullbackBOSDuringConsol = true;
+    }
+
+    if(g_consol.active)
+    {
+        bool breakout = (bodyHi > g_consol.bufferedHigh || bodyLo < g_consol.bufferedLow);
+        if(bosUp || bosDown || pullbackBOSDuringConsol || breakout)
+        {
+            g_consol.active = false;
+            if(InpDebugLog) Print("Consolidation ENDED");
+        }
+    }
+
+    if(sellSignal)
+    {
+        g_emaCaptureShort = g_emaAboveSlow;
+
+        if(g_isUptrend)
+        {
+            g_arm = ARM_PULLBACK_DOWN;
+            g_emaBelowSlow = false;
+
+            if(g_consol.active)
+            {
+                g_consol.active = false;
+                if(InpDebugLog) Print("[Consol] Reset durch PULLBACK_DOWN");
+            }
+
+            if(CheckSameBarEMA(true))
+            {
+                g_emaBelowSlow = true;
+                if(InpDebugLog) Print("[EMA] Same-Bar-Fix SELL: belowEMA=TRUE");
+            }
+        }
+        else
+            g_arm = ARM_MOVE_DOWN;
+
+        g_emaAboveSlow = false;
+        g_bosInArm     = false;
+
+        if(g_stExtr.lastHigh > 0)
+        {
+            g_validSH    = g_stExtr.lastHigh;
+            g_validSHBar = iBarShift(_Symbol, PERIOD_CURRENT, g_stExtr.lastHighTime);
+            if(InpShowSwingLabels)
+                DrawCTFSwingLabel("SH_" + IntegerToString(TimeCurrent()), g_validSHBar, g_stExtr.lastHigh, true);
+            if(InpDebugLog) Print("H @Bar ", g_validSHBar, " P=", g_stExtr.lastHigh,
+                                  " EMA-Short=", g_emaCaptureShort, " arm=", ArmToString(g_arm));
+        }
+        else
+            if(InpDebugLog) Print("[SELL] kein lastHigh - arm=", ArmToString(g_arm));
+    }
+
+    if(buySignal)
+    {
+        g_emaCaptureLong = g_emaBelowSlow;
+
+        if(g_isDowntrend)
+        {
+            g_arm = ARM_PULLBACK_UP;
+            g_emaAboveSlow = false;
+
+            if(g_consol.active)
+            {
+                g_consol.active = false;
+                if(InpDebugLog) Print("[Consol] Reset durch PULLBACK_UP");
+            }
+
+            if(CheckSameBarEMA(false))
+            {
+                g_emaAboveSlow = true;
+                if(InpDebugLog) Print("[EMA] Same-Bar-Fix BUY: aboveEMA=TRUE");
+            }
+        }
+        else
+            g_arm = ARM_MOVE_UP;
+
+        g_emaBelowSlow = false;
+        g_bosInArm     = false;
+
+        if(g_stExtr.lastLow > 0)
+        {
+            g_validSL    = g_stExtr.lastLow;
+            g_validSLBar = iBarShift(_Symbol, PERIOD_CURRENT, g_stExtr.lastLowTime);
+            if(InpShowSwingLabels)
+                DrawCTFSwingLabel("SL_" + IntegerToString(TimeCurrent()), g_validSLBar, g_stExtr.lastLow, false);
+            if(InpDebugLog) Print("L @Bar ", g_validSLBar, " P=", g_stExtr.lastLow,
+                                  " EMA-Long=", g_emaCaptureLong, " arm=", ArmToString(g_arm));
+        }
+        else
+            if(InpDebugLog) Print("[BUY] kein lastLow - arm=", ArmToString(g_arm));
+    }
+
+    if(moveArmEndedWithoutBOS && !g_consol.active && InpShowConsolidation)
+    {
+        g_consol.active    = true;
+        g_consol.startTime = (datetime)MathMin(iTime(_Symbol, PERIOD_CURRENT, g_validSHBar),
+                                               iTime(_Symbol, PERIOD_CURRENT, g_validSLBar));
+        g_consol.rangeHigh  = g_validSH;
+        g_consol.rangeLow   = g_validSL;
+        double _consolRange   = g_consol.rangeHigh - g_consol.rangeLow;
+        double _consolHalfBuf = _consolRange * (InpConsolBufferPct / 100.0) / 2.0;
+        g_consol.bufferedHigh = g_consol.rangeHigh + _consolHalfBuf;
+        g_consol.bufferedLow  = g_consol.rangeLow  - _consolHalfBuf;
+        if(InpDebugLog) Print("Consolidation START: H=", g_consol.rangeHigh, " L=", g_consol.rangeLow);
+    }
+
+    g_prevArm = g_arm;
+    DrawConsolidationBox();
+}
+
+//+==================================================================+
+//| SECTION 11: TRADE SIGNALS                                        |
+//+==================================================================+
+
+void CheckTradeSignals()
+{
+    if(!InpEnableTrade) return;
+    if(g_stTrend == g_stPrevTrend) return;
+
+    bool buySignal  = (g_stTrend == 1  && g_stPrevTrend == -1);
+    bool sellSignal = (g_stTrend == -1 && g_stPrevTrend == 1);
+
+    double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+    double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+    double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+    bool allowNew  = !g_consol.active;
+    bool inSession = IsInSession();
+    bool adxOK     = !InpUseADXFilter || !InpADXTradeFilter || (g_adxMA >= InpADXMinimum && g_adxMA <= InpADXMaximum);
+
+    if(buySignal)
+    {
+        bool noHigherHigh = (g_validSH == 0 || close1 <= g_validSH);
+        bool htfAligned   = IsHTFAligned(BOS_UP);
+        bool emaOK        = (InpEMAFilterMode == EMA_FILTER_DISABLED) || g_emaCaptureLong;
+
+        if(InpDebugLog)
+            Print("[LONG] up=", g_isUptrend, " ema=", emaOK,
+                  " (cap=", g_emaCaptureLong, " below=", g_emaBelowSlow, ")",
+                  " noHH=", noHigherHigh, " (close=", close1, " SH=", g_validSH, ")",
+                  " allow=", allowNew, " htf=", htfAligned,
+                  " sess=", inSession, " adx=", adxOK, " consol=", g_consol.active);
+
+        if(g_isUptrend && emaOK && noHigherHigh && InpAllowLongTrades
+           && allowNew && htfAligned && inSession && adxOK)
+        {
+            // FIX B: Gegenposition nur schließen wenn Verlust im akzeptablen Bereich
+            if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            {
+                double posProfit = PositionGetDouble(POSITION_PROFIT);
+                if(posProfit >= InpMaxCounterLoss)
+                {
+                    g_trade.PositionClose(_Symbol);
+                    if(InpDebugLog) Print("[CLOSE SHORT] Profit=", posProfit, " >= Limit=", InpMaxCounterLoss);
+                }
+                else
+                {
+                    Print("[SKIP CLOSE SHORT] Profit=", posProfit, " < Limit=", InpMaxCounterLoss,
+                          " – Datenschutz aktiv, kein neuer Trade");
+                    return;
+                }
+            }
+
+            double sl = (g_validSL > 0) ? g_validSL : low1 * 0.98;
+            double tp = (g_validSH > 0) ? g_validSH : high1 * 1.02;
+
+            if(InpUseFixedRRR) tp = close1 + MathAbs(close1 - sl) * InpRiskRewardRatio;
+            if(InpStopLossPoints > 0)   sl = low1  - InpStopLossPoints * _Point;
+            if(InpTakeProfitPoints > 0) tp = high1 + InpTakeProfitPoints * _Point;
+
+            g_pos.entryPrice    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            g_pos.targetTP      = tp;
+            g_pos.stopLoss      = sl;
+            g_pos.initialRisk   = MathAbs(g_pos.entryPrice - sl);
+            g_pos.beTriggered   = false;
+            g_pos.tpTriggered   = false;
+            g_pos.isLong        = true;
+            g_pos.partialClosed = false;
+            g_pos.active        = true;
+
+            double orderTP = InpUseTrailingSL ? 0 : tp;
+            g_trade.Buy(InpLotSize, _Symbol, 0, sl, orderTP, "DTFX LONG");
+
+            Print("LONG: Entry=", g_pos.entryPrice, " SL=", sl, " TP=", tp);
+            if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+            {
+                LogTrade("BUY", g_pos.entryPrice, sl, tp, true, g_emaCaptureLong, noHigherHigh, allowNew, htfAligned);
+                g_emaCaptureLong = false;
+                g_emaBelowSlow   = false;
+            }
+        }
+        else if(!htfAligned && InpDebugLog)
+            Print("LONG BLOCKED: HTF (", BosToString(g_htfBosDir), ")");
+    }
+
+    if(sellSignal)
+    {
+        bool noLowerLow = (g_validSL == 0 || close1 >= g_validSL);
+        bool htfAligned = IsHTFAligned(BOS_DOWN);
+        bool emaOK      = (InpEMAFilterMode == EMA_FILTER_DISABLED) || g_emaCaptureShort;
+
+        if(InpDebugLog)
+            Print("[SHORT] dn=", g_isDowntrend, " ema=", emaOK,
+                  " (cap=", g_emaCaptureShort, " above=", g_emaAboveSlow, ")",
+                  " noLL=", noLowerLow, " allow=", allowNew,
+                  " htf=", htfAligned, " sess=", inSession, " adx=", adxOK);
+
+        if(g_isDowntrend && emaOK && noLowerLow && InpAllowShortTrades
+           && allowNew && htfAligned && inSession && adxOK)
+        {
+            // FIX B: Gegenposition nur schließen wenn Verlust im akzeptablen Bereich
+            if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            {
+                double posProfit = PositionGetDouble(POSITION_PROFIT);
+                if(posProfit >= InpMaxCounterLoss)
+                {
+                    g_trade.PositionClose(_Symbol);
+                    if(InpDebugLog) Print("[CLOSE LONG] Profit=", posProfit, " >= Limit=", InpMaxCounterLoss);
+                }
+                else
+                {
+                    Print("[SKIP CLOSE LONG] Profit=", posProfit, " < Limit=", InpMaxCounterLoss,
+                          " – Datenschutz aktiv, kein neuer Trade");
+                    return;
+                }
+            }
+
+            double sl = (g_validSH > 0) ? g_validSH : high1 * 1.02;
+            double tp = (g_validSL > 0) ? g_validSL : low1 * 0.98;
+
+            if(InpUseFixedRRR) tp = close1 - MathAbs(close1 - sl) * InpRiskRewardRatio;
+            if(InpStopLossPoints > 0)   sl = high1 + InpStopLossPoints * _Point;
+            if(InpTakeProfitPoints > 0) tp = low1  - InpTakeProfitPoints * _Point;
+
+            g_pos.entryPrice    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            g_pos.targetTP      = tp;
+            g_pos.stopLoss      = sl;
+            g_pos.initialRisk   = MathAbs(g_pos.entryPrice - sl);
+            g_pos.beTriggered   = false;
+            g_pos.tpTriggered   = false;
+            g_pos.isLong        = false;
+            g_pos.partialClosed = false;
+            g_pos.active        = true;
+
+            double orderTP = InpUseTrailingSL ? 0 : tp;
+            g_trade.Sell(InpLotSize, _Symbol, 0, sl, orderTP, "DTFX SHORT");
+
+            Print("SHORT: Entry=", g_pos.entryPrice, " SL=", sl, " TP=", tp);
+            if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+            {
+                LogTrade("SELL", g_pos.entryPrice, sl, tp, true, g_emaCaptureShort, noLowerLow, allowNew, htfAligned);
+                g_emaCaptureShort = false;
+                g_emaAboveSlow    = false;
+            }
+        }
+        else if(!htfAligned && InpDebugLog)
+            Print("SHORT BLOCKED: HTF (", BosToString(g_htfBosDir), ")");
+    }
+}
+
+//+==================================================================+
+//| SECTION 12: TRADE MANAGEMENT                                     |
+//+==================================================================+
+
+void ManageOpenTrades()
+{
+    if(!PositionSelect(_Symbol))
+    {
+        g_pos.Reset();
+        return;
+    }
+    if(!g_pos.active) return;
+
+    double currentSL    = PositionGetDouble(POSITION_SL);
+    double currentTP    = PositionGetDouble(POSITION_TP);
+    double currentBid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double currentAsk   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double currentPrice = g_pos.isLong ? currentBid : currentAsk;
+    double newSL        = currentSL;
+    bool   modifyNeeded = false;
+
+    if(InpUseBreakeven && !g_pos.beTriggered && g_pos.initialRisk > 0)
+    {
+        if(g_pos.isLong && currentPrice >= g_pos.entryPrice + InpBreakevenR * g_pos.initialRisk)
+        {
+            newSL              = MathMax(newSL, g_pos.entryPrice);
+            g_pos.beTriggered  = true;
+            modifyNeeded       = true;
+            Print("[BE] Long: SL → Entry ", g_pos.entryPrice);
+        }
+        else if(!g_pos.isLong && currentPrice <= g_pos.entryPrice - InpBreakevenR * g_pos.initialRisk)
+        {
+            newSL              = (newSL > 0) ? MathMin(newSL, g_pos.entryPrice) : g_pos.entryPrice;
+            g_pos.beTriggered  = true;
+            modifyNeeded       = true;
+            Print("[BE] Short: SL → Entry ", g_pos.entryPrice);
+        }
+    }
+
+    if(InpUseTrailingSL)
+    {
+        if(!g_pos.tpTriggered && g_pos.targetTP > 0)
+        {
+            bool tpHit = g_pos.isLong ? (currentPrice >= g_pos.targetTP)
+                                      : (currentPrice <= g_pos.targetTP);
+            if(tpHit)
+            {
+                g_pos.tpTriggered = true;
+                Print("[Scaling] TP1 ", g_pos.targetTP, " erreicht → Runner aktiv");
+
+                if(InpUsePartialClose && !g_pos.partialClosed)
+                {
+                    double posVol   = PositionGetDouble(POSITION_VOLUME);
+                    double closeVol = NormalizeDouble(posVol * InpPartialClosePercent / 100.0, 2);
+                    double minVol   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+                    if(closeVol >= minVol && (posVol - closeVol) >= minVol)
+                    {
+                        if(g_trade.PositionClosePartial(_Symbol, closeVol))
+                        {
+                            g_pos.partialClosed = true;
+                            Print("[Partial] ", closeVol, " Lots @ TP1");
+                        }
+                    }
+                }
+
+                if(g_pos.isLong)
+                {
+                    double slTarget = 0;
+                    if(InpScalingMethod == SCALING_SUPERTREND && g_stPrevUp > 0)
+                        slTarget = g_stPrevUp;
+                    else if(InpScalingMethod == SCALING_VALID_SWING && g_validSL > g_pos.entryPrice)
+                        slTarget = g_validSL;
+
+                    if(slTarget > g_pos.entryPrice)
+                    {
+                        newSL = MathMax(newSL, slTarget);
+                        Print("[Scaling] Long TP1: SL → ", (InpScalingMethod == SCALING_SUPERTREND ? "ST-Up " : "validSL "), slTarget);
+                    }
+                    else
+                    {
+                        newSL = MathMax(newSL, g_pos.entryPrice);
+                        Print("[Scaling] Long TP1: kein Level über Entry → BE ", g_pos.entryPrice);
+                    }
+                }
+                else
+                {
+                    double slTarget = 0;
+                    if(InpScalingMethod == SCALING_SUPERTREND && g_stPrevDn > 0)
+                        slTarget = g_stPrevDn;
+                    else if(InpScalingMethod == SCALING_VALID_SWING && g_validSH > 0 && g_validSH < g_pos.entryPrice)
+                        slTarget = g_validSH;
+
+                    if(slTarget > 0 && slTarget < g_pos.entryPrice)
+                    {
+                        newSL = (newSL > 0) ? MathMin(newSL, slTarget) : slTarget;
+                        Print("[Scaling] Short TP1: SL → ", (InpScalingMethod == SCALING_SUPERTREND ? "ST-Dn " : "validSH "), slTarget);
+                    }
+                    else
+                    {
+                        newSL = (newSL > 0) ? MathMin(newSL, g_pos.entryPrice) : g_pos.entryPrice;
+                        Print("[Scaling] Short TP1: kein Level unter Entry → BE ", g_pos.entryPrice);
+                    }
+                }
+                modifyNeeded = true;
+            }
+        }
+
+        if(g_pos.tpTriggered)
+        {
+            if(g_pos.isLong)
+            {
+                double trailLevel = (InpScalingMethod == SCALING_SUPERTREND) ? g_stPrevUp : g_validSL;
+                if(trailLevel > 0 && trailLevel > newSL)
+                {
+                    Print("[Trailing] Long SL: ", newSL, " → ", trailLevel);
+                    newSL        = trailLevel;
+                    modifyNeeded = true;
+                }
+            }
+            else
+            {
+                double trailLevel = (InpScalingMethod == SCALING_SUPERTREND) ? g_stPrevDn : g_validSH;
+                if(trailLevel > 0 && newSL > 0 && trailLevel < newSL)
+                {
+                    Print("[Trailing] Short SL: ", newSL, " → ", trailLevel);
+                    newSL        = trailLevel;
+                    modifyNeeded = true;
+                }
+            }
+        }
+    }
+
+    if(modifyNeeded && MathAbs(newSL - currentSL) > _Point)
+    {
+        g_pos.stopLoss = newSL;
+        double newTP = (InpUseTrailingSL && g_pos.tpTriggered) ? 0 : currentTP;
+        if(g_trade.PositionModify(_Symbol, NormalizeDouble(newSL, _Digits), NormalizeDouble(newTP, _Digits)))
+            Print("[Modify] SL → ", newSL, (g_pos.beTriggered ? " [BE]" : ""), (g_pos.tpTriggered ? " [Trail]" : ""));
+        else
+            Print("[Modify] Fehler: ", GetLastError());
+    }
+}
+
+//+==================================================================+
+//| SECTION 13: HTF LOGIC                                            |
+//+==================================================================+
+
+void InitializeHTFSwingStructure()
+{
+    if(!InpUseHTF) return;
+
+    int htfBars = iBars(_Symbol, InpHTFTimeframe);
+    if(htfBars < 34) return;
+
+    int highestBar = iHighest(_Symbol, InpHTFTimeframe, MODE_HIGH, 34, 1);
+    int lowestBar  = iLowest(_Symbol, InpHTFTimeframe, MODE_LOW, 34, 1);
+
+    g_htfValidSH = iHigh(_Symbol, InpHTFTimeframe, highestBar);
+    g_htfValidSL = iLow(_Symbol, InpHTFTimeframe, lowestBar);
+
+    double curHigh  = iHigh(_Symbol, InpHTFTimeframe, 1);
+    double prevHigh = iHigh(_Symbol, InpHTFTimeframe, 2);
+    g_htfTrend     = (curHigh > prevHigh) ? 1 : -1;
+    g_htfPrevTrend = g_htfTrend;
+    g_htfBosDir    = (g_htfTrend == 1) ? BOS_UP : BOS_DOWN;
+
+    if(InpShowSwingLabels)
+    {
+        DrawHTFSwingLabel("HTF_SH_INIT", highestBar, g_htfValidSH, true);
+        DrawHTFSwingLabel("HTF_SL_INIT", lowestBar, g_htfValidSL, false);
+    }
+
+    g_htfInitialized = true;
+    g_lastHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
+    Print("HTF init: SH=", g_htfValidSH, " SL=", g_htfValidSL, " TF=", EnumToString(InpHTFTimeframe));
+}
+
+void UpdateHTFSwingStructure()
+{
+    if(!InpUseHTF || !g_htfInitialized) return;
+
+    datetime curHTFBarTime = iTime(_Symbol, InpHTFTimeframe, 0);
+    if(curHTFBarTime == g_lastHTFBarTime) return;
+    g_lastHTFBarTime = curHTFBarTime;
+
+    CalculateHTFSupertrend();
+
+    bool htfBuy  = (g_htfTrend == 1  && g_htfPrevTrend == -1);
+    bool htfSell = (g_htfTrend == -1 && g_htfPrevTrend == 1);
+
+    if(htfSell && g_htfExtr.lastHigh > 0)
+    {
+        g_htfValidSH = g_htfExtr.lastHigh;
+        int barIdx = iBarShift(_Symbol, InpHTFTimeframe, g_htfExtr.lastHighTime);
+        if(InpShowSwingLabels)
+            DrawHTFSwingLabel("HTF_SH_" + IntegerToString(TimeCurrent()), barIdx, g_htfExtr.lastHigh, true);
+        if(InpDebugLog) Print("HTF H @Bar ", barIdx, " P=", g_htfExtr.lastHigh);
+    }
+
+    if(htfBuy && g_htfExtr.lastLow > 0)
+    {
+        g_htfValidSL = g_htfExtr.lastLow;
+        int barIdx = iBarShift(_Symbol, InpHTFTimeframe, g_htfExtr.lastLowTime);
+        if(InpShowSwingLabels)
+            DrawHTFSwingLabel("HTF_SL_" + IntegerToString(TimeCurrent()), barIdx, g_htfExtr.lastLow, false);
+        if(InpDebugLog) Print("HTF L @Bar ", barIdx, " P=", g_htfExtr.lastLow);
+    }
+
+    double c1 = iClose(_Symbol, InpHTFTimeframe, 1);
+    double o1 = iOpen(_Symbol, InpHTFTimeframe, 1);
+    double bodyHi = MathMax(c1, o1);
+    double bodyLo = MathMin(c1, o1);
+
+    if(g_htfValidSH > 0 && bodyHi > g_htfValidSH)
+    {
+        g_htfBosDir = BOS_UP;
+        if(InpDebugLog) Print("HTF BOS UP: ", bodyHi, " > ", g_htfValidSH);
+    }
+    if(g_htfValidSL > 0 && bodyLo < g_htfValidSL)
+    {
+        g_htfBosDir = BOS_DOWN;
+        if(InpDebugLog) Print("HTF BOS DOWN: ", bodyLo, " < ", g_htfValidSL);
+    }
+}
+
+bool IsHTFAligned(ENUM_BOS_DIR direction)
+{
+    if(!InpUseHTF || !InpRequireHTFAlignment) return true;
+    return g_htfBosDir == direction;
+}
+
+//+==================================================================+
+//| SECTION 14: DRAWING FUNCTIONS                                    |
+//+==================================================================+
+
+void DrawSupertrendOnChart(string prefix, int atrHdl, ENUM_TIMEFRAMES tf,
+                           int maxBarsLimit, color upClr, color dnClr,
+                           int width, bool background)
+{
+    int bars = iBars(_Symbol, tf);
+    int maxBars = MathMin(bars, maxBarsLimit);
+
+    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(0, i);
+        if(StringFind(objName, prefix) >= 0)
+            ObjectDelete(0, objName);
+    }
+
+    double atr[], high_arr[], low_arr[], close_arr[];
+    ArraySetAsSeries(atr, true);
+    ArraySetAsSeries(high_arr, true);
+    ArraySetAsSeries(low_arr, true);
+    ArraySetAsSeries(close_arr, true);
+
+    if(CopyBuffer(atrHdl, 0, 0, maxBars, atr) < maxBars) return;
+    if(CopyHigh(_Symbol, tf, 0, maxBars, high_arr) < maxBars)  return;
+    if(CopyLow(_Symbol, tf, 0, maxBars, low_arr) < maxBars)    return;
+    if(CopyClose(_Symbol, tf, 0, maxBars, close_arr) < maxBars) return;
+
+    double up_arr[], dn_arr[];
+    int trend_arr[];
+    ArrayResize(up_arr, maxBars);
+    ArrayResize(dn_arr, maxBars);
+    ArrayResize(trend_arr, maxBars);
+
+    for(int i = maxBars - 1; i >= 0; i--)
+    {
+        double src = (high_arr[i] + low_arr[i]) / 2.0;
+        double up  = src - InpSTmultiplier * atr[i];
+        double dn  = src + InpSTmultiplier * atr[i];
+
+        if(i < maxBars - 1)
+        {
+            if(close_arr[i + 1] > up_arr[i + 1]) up = MathMax(up, up_arr[i + 1]);
+            if(close_arr[i + 1] < dn_arr[i + 1]) dn = MathMin(dn, dn_arr[i + 1]);
+
+            int pt = trend_arr[i + 1];
+            trend_arr[i] = pt;
+            if(pt == -1 && close_arr[i] > dn_arr[i + 1])     trend_arr[i] = 1;
+            else if(pt == 1 && close_arr[i] < up_arr[i + 1]) trend_arr[i] = -1;
+        }
+        else
+            trend_arr[i] = 1;
+
+        up_arr[i] = up;
+        dn_arr[i] = dn;
+    }
+
+    for(int i = maxBars - 2; i >= 0; i--)
+    {
+        datetime t1 = iTime(_Symbol, tf, i + 1);
+        datetime t2 = iTime(_Symbol, tf, i);
+
+        double p1, p2;
+        color  lineClr;
+
+        bool trendChanged = (trend_arr[i] != trend_arr[i + 1]);
+
+        if(trend_arr[i + 1] == 1)
+        { p1 = up_arr[i + 1]; p2 = up_arr[i]; lineClr = upClr; }
+        else
+        { p1 = dn_arr[i + 1]; p2 = dn_arr[i]; lineClr = dnClr; }
+
+        if(trendChanged && i >= maxBars - 2) continue;
+
+        string objName = prefix + IntegerToString(i);
+        if(ObjectCreate(0, objName, OBJ_TREND, 0, t1, p1, t2, p2))
+        {
+            ObjectSetInteger(0, objName, OBJPROP_COLOR, lineClr);
+            ObjectSetInteger(0, objName, OBJPROP_WIDTH, width);
+            ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, objName, OBJPROP_BACK, background);
+        }
+    }
+
+    ChartRedraw();
+}
+
+void DrawSingleEMALine(int handle, string namePrefix, color col, int lineWidth, int maxBars)
+{
+    double ema[];
+    ArraySetAsSeries(ema, true);
+    if(CopyBuffer(handle, 0, 0, maxBars, ema) < maxBars) return;
+
+    for(int i = maxBars - 2; i >= 0; i--)
+    {
+        datetime t1 = iTime(_Symbol, PERIOD_CURRENT, i + 1);
+        datetime t2 = iTime(_Symbol, PERIOD_CURRENT, i);
+
+        string objName = namePrefix + "_" + IntegerToString(i);
+        ObjectDelete(0, objName);
+
+        if(ObjectCreate(0, objName, OBJ_TREND, 0, t1, ema[i + 1], t2, ema[i]))
+        {
+            ObjectSetInteger(0, objName, OBJPROP_COLOR, col);
+            ObjectSetInteger(0, objName, OBJPROP_WIDTH, lineWidth);
+            ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, objName, OBJPROP_BACK, true);
+        }
+    }
+}
+
+void DrawEMALines()
+{
+    if(!InpShowEMALines) return;
+    int maxBars = MathMin(Bars(_Symbol, PERIOD_CURRENT), 500);
+    DrawSingleEMALine(g_emaFastHandle, "DTFX_EMA_Fast", InpEMAFastColor, InpEMAWidth, maxBars);
+    DrawSingleEMALine(g_emaSlowHandle, "DTFX_EMA_Slow", InpEMASlowColor, InpEMAWidth, maxBars);
+    ChartRedraw();
+}
+
+void DrawSwingTriangle(string name, datetime time, double price, bool isHigh,
+                       color triColor, double atrOffset, double sizeMultiplier,
+                       long timeOffsetSec, int lineWidth)
+{
+    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+
+    double adjusted  = isHigh ? (price + atrOffset) : (price - atrOffset);
+    double triSize   = atrOffset * sizeMultiplier;
+    datetime tOff    = (datetime)timeOffsetSec;
+
+    datetime t1, t2, t3;
+    double   p1, p2, p3;
+
+    if(isHigh)
+    {
+        t1 = time - tOff; p1 = adjusted + triSize;
+        t2 = time + tOff; p2 = adjusted + triSize;
+        t3 = time;         p3 = adjusted;
+    }
+    else
+    {
+        t1 = time - tOff; p1 = adjusted - triSize;
+        t2 = time + tOff; p2 = adjusted - triSize;
+        t3 = time;         p3 = adjusted;
+    }
+
+    if(ObjectCreate(0, name, OBJ_TRIANGLE, 0, t1, p1, t2, p2, t3, p3))
+    {
+        ObjectSetInteger(0, name, OBJPROP_COLOR, triColor);
+        ObjectSetInteger(0, name, OBJPROP_FILL, true);
+        ObjectSetInteger(0, name, OBJPROP_BACK, false);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, lineWidth);
+    }
+}
+
+void DrawCTFSwingLabel(string name, int shift, double price, bool isHigh)
+{
+    datetime time = iTime(_Symbol, PERIOD_CURRENT, shift);
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    double offset;
+
+    if(CopyBuffer(g_atrHandle, 0, shift, 1, atrBuf) > 0)
+        offset = atrBuf[0] * 0.5;
+    else
+        offset = (iHigh(_Symbol, PERIOD_CURRENT, shift) - iLow(_Symbol, PERIOD_CURRENT, shift)) * 2;
+
+    color col = isHigh ? clrRed : clrLime;
+    DrawSwingTriangle(name, time, price, isHigh, col, offset, 0.3,
+                      PeriodSeconds(PERIOD_CURRENT), 2);
+}
+
+void DrawHTFSwingLabel(string name, int htfShift, double price, bool isHigh)
+{
+    datetime htfBarTime    = iTime(_Symbol, InpHTFTimeframe, htfShift);
+    datetime htfBarEndTime = htfBarTime + PeriodSeconds(InpHTFTimeframe);
+    int ctfStart = iBarShift(_Symbol, PERIOD_CURRENT, htfBarEndTime);
+    int ctfEnd   = iBarShift(_Symbol, PERIOD_CURRENT, htfBarTime);
+
+    int extremeBar      = ctfEnd;
+    double extremeValue = isHigh ? 0 : DBL_MAX;
+
+    for(int i = ctfStart; i <= ctfEnd; i++)
+    {
+        if(isHigh)
+        {
+            double h = iHigh(_Symbol, PERIOD_CURRENT, i);
+            if(h > extremeValue) { extremeValue = h; extremeBar = i; }
+        }
+        else
+        {
+            double l = iLow(_Symbol, PERIOD_CURRENT, i);
+            if(l < extremeValue) { extremeValue = l; extremeBar = i; }
+        }
+    }
+
+    datetime time = iTime(_Symbol, PERIOD_CURRENT, extremeBar);
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    double offset;
+
+    if(CopyBuffer(g_atrHandle, 0, extremeBar, 1, atrBuf) > 0)
+        offset = atrBuf[0] * 0.8;
+    else
+        offset = (iHigh(_Symbol, PERIOD_CURRENT, extremeBar) - iLow(_Symbol, PERIOD_CURRENT, extremeBar)) * 3;
+
+    long htfTimeOff = (long)(PeriodSeconds(InpHTFTimeframe) * 0.5);
+    DrawSwingTriangle(name, time, price, isHigh, InpHTFSwingColor, offset, 0.5, htfTimeOff, 3);
+}
+
+void DrawConsolidationBox()
+{
+    if(!InpShowConsolidation)
+    {
+        for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+        {
+            string objName = ObjectName(0, i);
+            if(StringFind(objName, "DTFX_Consol_") >= 0)
+                ObjectDelete(0, objName);
+        }
+        return;
+    }
+
+    if(!g_consol.active && g_consol.boxName != "")
+    {
+        if(ObjectFind(0, g_consol.boxName) >= 0)
+        {
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_TIME, 1, iTime(_Symbol, PERIOD_CURRENT, 0));
+            if(InpDebugLog) Print("Consolidation Box finalized: ", g_consol.boxName);
+        }
+        g_consol.boxName      = "";
+        g_consol.startTime    = 0;
+        g_consol.rangeHigh    = 0;
+        g_consol.rangeLow     = 0;
+        g_consol.bufferedHigh = 0;
+        g_consol.bufferedLow  = 0;
+        return;
+    }
+
+    if(g_consol.active && g_consol.startTime > 0 && g_consol.rangeHigh > 0 && g_consol.rangeLow > 0)
+    {
+        if(g_consol.boxName == "")
+            g_consol.boxName = "DTFX_Consol_" + IntegerToString(g_consol.startTime);
+
+        if(ObjectFind(0, g_consol.boxName) >= 0)
+            ObjectDelete(0, g_consol.boxName);
+
+        datetime curTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+        if(ObjectCreate(0, g_consol.boxName, OBJ_RECTANGLE, 0,
+                        g_consol.startTime, g_consol.bufferedHigh, curTime, g_consol.bufferedLow))
+        {
+            int transparency = (int)((InpConsolTransparency / 100.0) * 255);
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_COLOR, InpConsolColor);
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_WIDTH, InpConsolBorderWidth);
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_FILL, true);
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_BACK, true);
+
+            color bgColor = InpConsolColor;
+            long r = (bgColor & 0xFF);
+            long g = ((bgColor >> 8) & 0xFF);
+            long b = ((bgColor >> 16) & 0xFF);
+            long alphaColor = (transparency << 24) | (b << 16) | (g << 8) | r;
+            ObjectSetInteger(0, g_consol.boxName, OBJPROP_BGCOLOR, alphaColor);
+        }
+    }
+}
+
+//+==================================================================+
+//| SECTION 15: DASHBOARD                                            |
+//+==================================================================+
+
+void CreateDashboard()
+{
+    int x = InpDashboardX, y = InpDashboardY;
+
+    string bgName = PFX_DASH + "_BG";
+    if(ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+    {
+        ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x);
+        ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y);
+        ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 250);
+        ObjectSetInteger(0, bgName, OBJPROP_YSIZE, 285);
+        ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, InpDashboardBgColor);
+        ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+        ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetInteger(0, bgName, OBJPROP_BACK, true);
+    }
+
+    CreateDashLabel(PFX_DASH + "_Title",         x+10, y+10,  "DTFX STRATEGY CONTROL", clrWhite, 12);
+    CreateDashLabel(PFX_DASH + "_Trend",          x+10, y+35,  "CTF Trend: NONE",   InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_HTFTrend",       x+10, y+55,  "HTF Trend: NONE",   InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_STTrend",        x+10, y+80,  "ST Trend: NONE",    InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_SwingHigh",      x+10, y+100, "CTF High: 0.00000", InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_SwingLow",       x+10, y+120, "CTF Low: 0.00000",  InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_HTFSwingHigh",   x+10, y+140, "HTF High: 0.00000", InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_HTFSwingLow",    x+10, y+160, "HTF Low: 0.00000",  InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_HTFAlignment",   x+10, y+180, "HTF Aligned: NO",   InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_Position",       x+10, y+200, "Position: NONE",    InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_TP1Status",      x+10, y+220, "BE/TP1: NO",        InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_EMACondition",   x+10, y+240, "EMA: FALSE",        InpDashboardTextColor, 10);
+    CreateDashLabel(PFX_DASH + "_ADX",            x+10, y+260, "ADX: 0.0 / MA: 0.0", InpDashboardTextColor, 10);
+}
+
+void CreateDashLabel(string name, int x, int y, string text, color col, int fontSize)
+{
+    if(ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+    {
+        ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+        ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+        ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+        ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetString(0, name, OBJPROP_TEXT, text);
+        ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+    }
+}
+
+void UpdateDashboard()
+{
+    string trendText = (g_bosDir == BOS_UP) ? "UPTREND" : (g_bosDir == BOS_DOWN) ? "DOWNTREND" : "NONE";
+    color  trendClr  = (g_bosDir == BOS_UP) ? clrLime : (g_bosDir == BOS_DOWN) ? clrRed : clrGray;
+    ObjectSetString(0, PFX_DASH + "_Trend", OBJPROP_TEXT, "CTF Trend: " + trendText);
+    ObjectSetInteger(0, PFX_DASH + "_Trend", OBJPROP_COLOR, trendClr);
+
+    string htfText = (g_htfBosDir == BOS_UP) ? "UPTREND" : (g_htfBosDir == BOS_DOWN) ? "DOWNTREND" : "NONE";
+    color  htfClr  = (g_htfBosDir == BOS_UP) ? clrLime : (g_htfBosDir == BOS_DOWN) ? clrRed : clrGray;
+    ObjectSetString(0, PFX_DASH + "_HTFTrend", OBJPROP_TEXT, "HTF Trend: " + htfText);
+    ObjectSetInteger(0, PFX_DASH + "_HTFTrend", OBJPROP_COLOR, htfClr);
+
+    string stText = (g_stTrend == 1) ? "UPTREND" : "DOWNTREND";
+    color  stClr  = (g_stTrend == 1) ? clrLime : clrRed;
+    ObjectSetString(0, PFX_DASH + "_STTrend", OBJPROP_TEXT, "ST Trend: " + stText);
+    ObjectSetInteger(0, PFX_DASH + "_STTrend", OBJPROP_COLOR, stClr);
+
+    ObjectSetString(0, PFX_DASH + "_SwingHigh",   OBJPROP_TEXT, "CTF High: " + DoubleToString(g_validSH, _Digits));
+    ObjectSetString(0, PFX_DASH + "_SwingLow",    OBJPROP_TEXT, "CTF Low: "  + DoubleToString(g_validSL, _Digits));
+    ObjectSetString(0, PFX_DASH + "_HTFSwingHigh", OBJPROP_TEXT, "HTF High: " + DoubleToString(g_htfValidSH, _Digits));
+    ObjectSetString(0, PFX_DASH + "_HTFSwingLow",  OBJPROP_TEXT, "HTF Low: "  + DoubleToString(g_htfValidSL, _Digits));
+
+    string htfAlignText = "NO";
+    color  htfAlignClr  = clrRed;
+    if(InpUseHTF && InpRequireHTFAlignment)
+    {
+        if(g_bosDir == BOS_UP && g_htfBosDir == BOS_UP)
+        { htfAlignText = "YES (UP)"; htfAlignClr = clrLime; }
+        else if(g_bosDir == BOS_DOWN && g_htfBosDir == BOS_DOWN)
+        { htfAlignText = "YES (DOWN)"; htfAlignClr = clrLime; }
+        else
+        { htfAlignText = "NO (CTF:" + BosToString(g_bosDir) + " HTF:" + BosToString(g_htfBosDir) + ")"; htfAlignClr = clrRed; }
+    }
+    else if(InpUseHTF && !InpRequireHTFAlignment)
+    { htfAlignText = "OPTIONAL"; htfAlignClr = clrYellow; }
+    else
+    { htfAlignText = "DISABLED"; htfAlignClr = clrGray; }
+
+    ObjectSetString(0, PFX_DASH + "_HTFAlignment", OBJPROP_TEXT, "HTF Aligned: " + htfAlignText);
+    ObjectSetInteger(0, PFX_DASH + "_HTFAlignment", OBJPROP_COLOR, htfAlignClr);
+
+    string posText = "NONE"; color posClr = clrGray;
+    if(PositionSelect(_Symbol))
+    {
+        ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        if(pt == POSITION_TYPE_BUY) { posText = "LONG"; posClr = clrLime; }
+        else                        { posText = "SHORT"; posClr = clrRed; }
+    }
+    ObjectSetString(0, PFX_DASH + "_Position", OBJPROP_TEXT, "Position: " + posText);
+    ObjectSetInteger(0, PFX_DASH + "_Position", OBJPROP_COLOR, posClr);
+
+    string tp1Text = g_pos.tpTriggered ? "TP1 ✓" : (g_pos.beTriggered ? "BE ✓" : "NO");
+    color  tp1Clr  = g_pos.tpTriggered ? clrLime : (g_pos.beTriggered ? clrYellow : clrGray);
+    ObjectSetString(0, PFX_DASH + "_TP1Status", OBJPROP_TEXT, "BE/TP1: " + tp1Text);
+    ObjectSetInteger(0, PFX_DASH + "_TP1Status", OBJPROP_COLOR, tp1Clr);
+
+    string emaText = (g_emaBelowSlow && g_emaAboveSlow) ? "BOTH" :
+                     g_emaBelowSlow ? "BELOW" :
+                     g_emaAboveSlow ? "ABOVE" : "FALSE";
+    ObjectSetString(0, PFX_DASH + "_EMACondition", OBJPROP_TEXT, "EMA: " + emaText);
+
+    bool adxOKDash = !InpADXTradeFilter || (g_adxMA >= InpADXMinimum && g_adxMA <= InpADXMaximum);
+    string adxText = "ADX: " + DoubleToString(g_adxValue, 1) + " / MA: " + DoubleToString(g_adxMA, 1) +
+                     (adxOKDash ? " OK" : " BLOCKED");
+    color adxClr   = adxOKDash ? clrLime : clrRed;
+    ObjectSetString(0, PFX_DASH + "_ADX", OBJPROP_TEXT, adxText);
+    ObjectSetInteger(0, PFX_DASH + "_ADX", OBJPROP_COLOR, adxClr);
+
+    ChartRedraw();
+}
+
+//+==================================================================+
+//| SECTION 16: SESSION FILTER                                       |
+//+==================================================================+
+
+bool IsHourInSession(int hour, int startHour, int endHour)
+{
+    if(startHour <= endHour)
+        return (hour >= startHour && hour < endHour);
+    else
+        return (hour >= startHour || hour < endHour);
+}
+
+bool IsHourBlocked(int hour)
+{
+    if(InpBlockHour1 >= 0 && hour == InpBlockHour1) return true;
+    if(InpBlockHour2 >= 0 && hour == InpBlockHour2) return true;
+    if(InpBlockHour3 >= 0 && hour == InpBlockHour3) return true;
+    if(InpBlockHour4 >= 0 && hour == InpBlockHour4) return true;
+    if(InpBlockHour5 >= 0 && hour == InpBlockHour5) return true;
+    return false;
+}
+
+bool IsInSession()
+{
+    if(!InpUseSessionFilter) return true;
+
+    MqlDateTime gmtTime;
+    TimeToStruct(TimeGMT(), gmtTime);
+    int hour = gmtTime.hour;
+
+    if(IsHourBlocked(hour)) return false;
+
+    bool inLondon = InpEnableLondon && IsHourInSession(hour, InpLondonStartHour, InpLondonEndHour);
+    bool inNY     = InpEnableNY     && IsHourInSession(hour, InpNYStartHour,     InpNYEndHour);
+    bool inAsia   = InpEnableAsia   && IsHourInSession(hour, InpAsiaStartHour,   InpAsiaEndHour);
+
+    return inLondon || inNY || inAsia;
+}
+
+//+==================================================================+
+//| SECTION 17: CSV LOGGING                                          |
+//+==================================================================+
+
+string GetSession()
+{
+    MqlDateTime gmt;
+    TimeToStruct(TimeGMT(), gmt);
+    int h = gmt.hour;
+    if(h >= 13 && h < 16) return "Overlap";
+    if(h >=  7 && h < 13) return "London";
+    if(h >= 16 && h < 21) return "NY";
+    if(h >= 21 || h <  6) return "Asia";
+    return "Off";
+}
+
+void LogTrade(string tradeType, double entryPrice, double sl, double tp,
+              bool allowDir, bool emaAllow, bool swingIntact, bool rangeWide, bool htfAlign)
+{
+    if(g_logFileName == "") return;
+
+    int fh = FileOpen("DTFX_Logs\\" + g_logFileName, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE) { Print("CSV Log ERROR: ", GetLastError()); return; }
+    FileSeek(fh, 0, SEEK_END);
+
+    double atrVal = 0;
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuf) > 0) atrVal = atrBuf[0];
+
+    string line =
+        TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + "," +
+        "OLD," + tradeType + "," + GetSession() + "," +
+        DoubleToString(entryPrice, _Digits) + "," +
+        DoubleToString(sl, _Digits) + "," +
+        DoubleToString(tp, _Digits) + "," +
+        DoubleToString(g_validSH, _Digits) + "," +
+        DoubleToString(g_validSL, _Digits) + "," +
+        DoubleToString(atrVal, _Digits) + "," +
+        IntegerToString((int)allowDir) + "," +
+        IntegerToString((int)emaAllow) + "," +
+        IntegerToString((int)swingIntact) + "," +
+        IntegerToString((int)rangeWide) + "," +
+        IntegerToString((int)htfAlign) + "," +
+        DoubleToString(g_adxValue, _Digits) + "\r\n";
+
+    FileWriteString(fh, line);
+    FileClose(fh);
+}
+
+void LogTradeResult(string result, datetime entryTime, double entryPrice, double closePrice, double profit)
+{
+    if(g_logFileName == "") return;
+
+    int fh = FileOpen("DTFX_Logs\\" + g_logFileName, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE) return;
+    FileSeek(fh, 0, SEEK_END);
+
+    string line =
+        TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + "," +
+        "OLD,CLOSE," +
+        TimeToString(entryTime, TIME_DATE | TIME_MINUTES) + "," +
+        DoubleToString(entryPrice, _Digits) + "," +
+        DoubleToString(closePrice, _Digits) + "," +
+        result + "," + DoubleToString(profit, 2) + "\r\n";
+
+    FileWriteString(fh, line);
+    FileClose(fh);
+}
+
+//+==================================================================+
+//| SECTION 18: TRADE CLOSE DETECTION                                |
+//+==================================================================+
+
+void CheckTradeClose()
+{
+    static ulong    trackedTickets[];
+    static datetime trackedTimes[];
+
+    ulong    openTickets[];
+    datetime openTimes[];
+    int posTotal = PositionsTotal();
+    for(int i = 0; i < posTotal; i++)
+    {
+        ulong tk = PositionGetTicket(i);
+        if(!PositionSelectByTicket(tk)) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        int n = ArraySize(openTickets);
+        ArrayResize(openTickets, n + 1);
+        ArrayResize(openTimes,   n + 1);
+        openTickets[n] = tk;
+        openTimes[n]   = (datetime)PositionGetInteger(POSITION_TIME);
+    }
+
+    for(int i = 0; i < ArraySize(openTickets); i++)
+    {
+        bool found = false;
+        for(int j = 0; j < ArraySize(trackedTickets); j++)
+            if(trackedTickets[j] == openTickets[i]) { found = true; break; }
+        if(!found)
+        {
+            int n = ArraySize(trackedTickets);
+            ArrayResize(trackedTickets, n + 1);
+            ArrayResize(trackedTimes,   n + 1);
+            trackedTickets[n] = openTickets[i];
+            trackedTimes[n]   = openTimes[i];
+        }
+    }
+
+    for(int j = ArraySize(trackedTickets) - 1; j >= 0; j--)
+    {
+        bool stillOpen = false;
+        for(int i = 0; i < ArraySize(openTickets); i++)
+            if(openTickets[i] == trackedTickets[j]) { stillOpen = true; break; }
+
+        if(!stillOpen)
+        {
+            ulong    closedTk = trackedTickets[j];
+            datetime entryTm  = trackedTimes[j];
+
+            HistorySelectByPosition(closedTk);
+
+            string result     = "UNKNOWN";
+            double closePrice = 0;
+            double entryPrice = 0;
+            double profit     = 0;
+
+            for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+            {
+                ulong dk = HistoryDealGetTicket(i);
+                if(HistoryDealGetString(dk, DEAL_SYMBOL) != _Symbol)              continue;
+                if(HistoryDealGetInteger(dk, DEAL_ENTRY) != DEAL_ENTRY_OUT)       continue;
+                if((ulong)HistoryDealGetInteger(dk, DEAL_POSITION_ID) != closedTk) continue;
+
+                closePrice = HistoryDealGetDouble(dk, DEAL_PRICE);
+                profit     = HistoryDealGetDouble(dk, DEAL_PROFIT);
+                ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dk, DEAL_REASON);
+
+                for(int k = 0; k < HistoryDealsTotal(); k++)
+                {
+                    ulong t2 = HistoryDealGetTicket(k);
+                    if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == closedTk &&
+                       HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                    {
+                        entryPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+                        break;
+                    }
+                }
+
+                if(reason == DEAL_REASON_TP)      result = "TP";
+                else if(reason == DEAL_REASON_SL) result = "SL";
+                else result = (profit > 0) ? "TP" : "SL";
+                break;
+            }
+
+            LogTradeResult(result, entryTm, entryPrice, closePrice, profit);
+            ArrayRemove(trackedTickets, j, 1);
+            ArrayRemove(trackedTimes,   j, 1);
+        }
+    }
+}
+
+//+==================================================================+
+//| SECTION 19: CLEANUP                                              |
+//+==================================================================+
+
+void DeleteAllObjects()
+{
+    // FIX A: Nur noch DTFX_ Prefix – "SH_" und "SL_" waren zu generisch
+    // und haben MT5-interne Chart-Objekte gelöscht → visuelle Fehler.
+    for(int i = ObjectsTotal(0, 0, -1) - 1; i >= 0; i--)
+    {
+        string objName = ObjectName(0, i, 0, -1);
+        if(StringFind(objName, "DTFX_") >= 0)
+            ObjectDelete(0, objName);
+    }
+    ChartRedraw();
+}
+//+------------------------------------------------------------------+
