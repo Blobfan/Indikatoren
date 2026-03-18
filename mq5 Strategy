@@ -3383,36 +3383,54 @@ void CheckTradeClose()
     static datetime trackedTimes[];
 
     // Build list of currently open positions on this symbol
+    // Pre-allocate to avoid O(n²) ArrayResize in loop
+    int posTotal = PositionsTotal();
     ulong   openTickets[];
     datetime openTimes[];
-    int posTotal = PositionsTotal();
+    ArrayResize(openTickets, posTotal);  // Pre-allocate max size
+    ArrayResize(openTimes,   posTotal);
+
+    int openCount = 0;
     for(int i = 0; i < posTotal; i++)
     {
         ulong tk = PositionGetTicket(i);
         if(!PositionSelectByTicket(tk)) continue;
         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-        int n = ArraySize(openTickets);
-        ArrayResize(openTickets, n + 1);
-        ArrayResize(openTimes,   n + 1);
-        openTickets[n] = tk;
-        openTimes[n]   = (datetime)PositionGetInteger(POSITION_TIME);
+
+        openTickets[openCount] = tk;
+        openTimes[openCount]   = (datetime)PositionGetInteger(POSITION_TIME);
+        openCount++;
     }
 
+    // Trim to actual size
+    ArrayResize(openTickets, openCount);
+    ArrayResize(openTimes,   openCount);
+
     // Add newly opened positions to tracking
+    // Pre-calculate max possible size to avoid resize in loop
+    int maxNewTracks = ArraySize(openTickets);
+    int currentTrackedSize = ArraySize(trackedTickets);
+    ArrayResize(trackedTickets, currentTrackedSize + maxNewTracks);
+    ArrayResize(trackedTimes,   currentTrackedSize + maxNewTracks);
+
+    int newTrackedCount = currentTrackedSize;
     for(int i = 0; i < ArraySize(openTickets); i++)
     {
         bool found = false;
-        for(int j = 0; j < ArraySize(trackedTickets); j++)
+        for(int j = 0; j < currentTrackedSize; j++)
             if(trackedTickets[j] == openTickets[i]) { found = true; break; }
+
         if(!found)
         {
-            int n = ArraySize(trackedTickets);
-            ArrayResize(trackedTickets, n + 1);
-            ArrayResize(trackedTimes,   n + 1);
-            trackedTickets[n] = openTickets[i];
-            trackedTimes[n]   = openTimes[i];
+            trackedTickets[newTrackedCount] = openTickets[i];
+            trackedTimes[newTrackedCount]   = openTimes[i];
+            newTrackedCount++;
         }
     }
+
+    // Trim to actual size
+    ArrayResize(trackedTickets, newTrackedCount);
+    ArrayResize(trackedTimes,   newTrackedCount);
 
     // Find and log closed positions (ticket tracked but no longer open)
     for(int j = ArraySize(trackedTickets) - 1; j >= 0; j--)
@@ -3433,7 +3451,27 @@ void CheckTradeClose()
             double entryPrice = 0;
             double profit     = 0;
 
-            for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+            // Pre-build lookup table for entry deals in single pass - O(n) instead of O(n²)
+            int totalDeals = HistoryDealsTotal();
+            ulong entryPositionIds[];
+            double entryPrices[];
+            ArrayResize(entryPositionIds, totalDeals);
+            ArrayResize(entryPrices, totalDeals);
+
+            int entryCount = 0;
+            for(int k = 0; k < totalDeals; k++)
+            {
+                ulong t2 = HistoryDealGetTicket(k);
+                if(HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                {
+                    entryPositionIds[entryCount] = (ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID);
+                    entryPrices[entryCount] = HistoryDealGetDouble(t2, DEAL_PRICE);
+                    entryCount++;
+                }
+            }
+
+            // Now search for exit deal - O(n) with cached entry lookup
+            for(int i = totalDeals - 1; i >= 0; i--)
             {
                 ulong dk = HistoryDealGetTicket(i);
                 if(HistoryDealGetString(dk,  DEAL_SYMBOL)  != _Symbol)        continue;
@@ -3444,13 +3482,12 @@ void CheckTradeClose()
                 profit     = HistoryDealGetDouble(dk, DEAL_PROFIT);
                 ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dk, DEAL_REASON);
 
-                for(int k = 0; k < HistoryDealsTotal(); k++)
+                // O(n) lookup instead of nested loop
+                for(int m = 0; m < entryCount; m++)
                 {
-                    ulong t2 = HistoryDealGetTicket(k);
-                    if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == closedTk &&
-                       HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                    if(entryPositionIds[m] == closedTk)
                     {
-                        entryPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+                        entryPrice = entryPrices[m];
                         break;
                     }
                 }
