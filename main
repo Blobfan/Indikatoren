@@ -1223,41 +1223,49 @@ f_isOpen(string _id) =>
             break
     _found
 
+// Helper function to clear a slot - reduces code duplication and array.set calls
+f_clearSlot(int idx) =>
+    array.set(arr_active, idx, false)
+    array.set(arr_entry,  idx, na)
+    array.set(arr_tp,     idx, na)
+    array.set(arr_sl,     idx, na)
+    array.set(arr_risk,   idx, na)
+    array.set(arr_be,     idx, false)
+    array.set(arr_tpHit,  idx, false)
+    array.set(arr_dir,    idx, "")
+    array.set(arr_num,    idx, 0)
+
 // ===== SLOT CLEANUP – geschlossene Trades aus Arrays entfernen =====
+// Optimized: Cache array.get() results to reduce redundant calls
 for _i = 0 to maxSimultaneousTrades - 1
-    if array.get(arr_active, _i)
-        string _eid = array.get(arr_dir, _i) + str.tostring(array.get(arr_num, _i))
+    bool _isActive = array.get(arr_active, _i)
+    if _isActive
+        // Cache dir and num to avoid multiple array.get calls
+        string _dir = array.get(arr_dir, _i)
+        int _num = array.get(arr_num, _i)
+        string _eid = _dir + str.tostring(_num)
         if not f_isOpen(_eid)
-            array.set(arr_active, _i, false)
-            array.set(arr_entry,  _i, na)
-            array.set(arr_tp,     _i, na)
-            array.set(arr_sl,     _i, na)
-            array.set(arr_risk,   _i, na)
-            array.set(arr_be,     _i, false)
-            array.set(arr_tpHit,  _i, false)
-            array.set(arr_dir,    _i, "")
-            array.set(arr_num,    _i, 0)
+            f_clearSlot(_i)
 
 // ===== Bei ST-Flip: Gegenrichtungs-Positionen schließen (Slot freigeben) =====
 // Nur schließen wenn Scaling aktiviert ist UND Breakeven bereits gesetzt wurde
 // Ohne das würde der alte Trade den Slot blockieren und der neue Entry könnte nicht feuern
+// Optimized: Cache array.get() results to reduce redundant calls
 if trendChanged and barstate.isconfirmed
     for _i = 0 to maxSimultaneousTrades - 1
-        if array.get(arr_active, _i)
+        bool _isActive = array.get(arr_active, _i)
+        if _isActive
+            // Cache values to avoid multiple array.get calls
             string _flipDir = array.get(arr_dir, _i)
+            bool _be = array.get(arr_be, _i)
+            int _num = array.get(arr_num, _i)
+
             bool _opposing = (buySignal and _flipDir == "S") or (sellSignal and _flipDir == "L")
-            bool _canCloseOnFlip = useTrailingSL and array.get(arr_be, _i)
+            bool _canCloseOnFlip = useTrailingSL and _be
+
             if _opposing and _canCloseOnFlip
-                strategy.close(_flipDir + str.tostring(array.get(arr_num, _i)), comment="ST Flip → Close")
-                array.set(arr_active, _i, false)
-                array.set(arr_entry,  _i, na)
-                array.set(arr_tp,     _i, na)
-                array.set(arr_sl,     _i, na)
-                array.set(arr_risk,   _i, na)
-                array.set(arr_be,     _i, false)
-                array.set(arr_tpHit,  _i, false)
-                array.set(arr_dir,    _i, "")
-                array.set(arr_num,    _i, 0)
+                strategy.close(_flipDir + str.tostring(_num), comment="ST Flip → Close")
+                f_clearSlot(_i)
 
 // Anzahl aktuell aktiver Slots zählen
 int activeSlots = 0
@@ -1499,11 +1507,12 @@ for _i = 0 to maxSimultaneousTrades - 1
         else
             strategy.exit("X_"   + _eid, from_entry=_eid, limit=_tp, stop=_newStop, comment=_cmt)
     // Im Scaling-Modus: Comments immer aktualisieren (auch wenn SL sich nicht geändert hat)
-    else if useTrailingSL and array.get(arr_active, _i)
-        string _cmt_always = "SL #" + str.tostring(array.get(arr_num, _i))
-        if array.get(arr_tpHit, _i)
-            _cmt_always := "TP #" + str.tostring(array.get(arr_num, _i))
-        strategy.exit("TSL_" + _eid, from_entry=_eid, stop=array.get(arr_sl, _i), comment=_cmt_always)
+    // Use cached values instead of redundant array.get calls
+    else if useTrailingSL
+        string _cmt_always = "SL #" + str.tostring(_num)
+        if _tpHit
+            _cmt_always := "TP #" + str.tostring(_num)
+        strategy.exit("TSL_" + _eid, from_entry=_eid, stop=_sl, comment=_cmt_always)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // END OF CODE
