@@ -273,6 +273,9 @@ double htfDnBuffer[];
 // Dashboard objects
 string dashboardName = "DTFX_Dashboard";
 
+// Hour blocking cache - O(1) lookup instead of O(5) conditional checks
+bool blockedHours[24];
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
@@ -348,6 +351,14 @@ int OnInit()
     // Create dashboard
     if(InpShowDashboard)
         CreateDashboard();
+
+    // Initialize blocked hours cache for O(1) lookup
+    ArrayInitialize(blockedHours, false);
+    if(InpBlockHour1 >= 0 && InpBlockHour1 < 24) blockedHours[InpBlockHour1] = true;
+    if(InpBlockHour2 >= 0 && InpBlockHour2 < 24) blockedHours[InpBlockHour2] = true;
+    if(InpBlockHour3 >= 0 && InpBlockHour3 < 24) blockedHours[InpBlockHour3] = true;
+    if(InpBlockHour4 >= 0 && InpBlockHour4 < 24) blockedHours[InpBlockHour4] = true;
+    if(InpBlockHour5 >= 0 && InpBlockHour5 < 24) blockedHours[InpBlockHour5] = true;
 
     Print("DTFX Strategy EA initialized successfully");
     return INIT_SUCCEEDED;
@@ -1935,17 +1946,34 @@ void UpdateSupertrendCandidates()
         bosOccurredInCurrentArm = false;
 
         // Scan bars from timeout H bar to current for initial pendingIntermedLow
-        pendingIntermedLow = iLow(_Symbol, PERIOD_CURRENT, 1);
-        pendingIntermedLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
-        for(int i = 1; i <= barIndex; i++)
+        // Use array buffers instead of repeated iLow/iTime calls - O(1) array access vs O(n) function calls
+        int scanBars = barIndex + 2;  // +2 for safety margin
+        double loBuffer[];
+        datetime tmBuffer[];
+        ArraySetAsSeries(loBuffer, true);
+        ArraySetAsSeries(tmBuffer, true);
+
+        if(CopyLow(_Symbol, PERIOD_CURRENT, 0, scanBars, loBuffer) >= scanBars &&
+           CopyTime(_Symbol, PERIOD_CURRENT, 0, scanBars, tmBuffer) >= scanBars)
         {
-            double lo = iLow(_Symbol, PERIOD_CURRENT, i);
-            if(lo < pendingIntermedLow)
+            pendingIntermedLow = loBuffer[1];
+            pendingIntermedLowTime = tmBuffer[1];
+            for(int i = 1; i <= barIndex && i < ArraySize(loBuffer); i++)
             {
-                pendingIntermedLow = lo;
-                pendingIntermedLowTime = iTime(_Symbol, PERIOD_CURRENT, i);
+                if(loBuffer[i] < pendingIntermedLow)
+                {
+                    pendingIntermedLow = loBuffer[i];
+                    pendingIntermedLowTime = tmBuffer[i];
+                }
             }
         }
+        else
+        {
+            // Fallback to function calls if array copy fails
+            pendingIntermedLow = iLow(_Symbol, PERIOD_CURRENT, 1);
+            pendingIntermedLowTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+
         // Initialize the low tracker
         lowSinceLastValidHigh = pendingIntermedLow;
         lowSinceLastValidHighTime = pendingIntermedLowTime;
@@ -1970,17 +1998,34 @@ void UpdateSupertrendCandidates()
         bosOccurredInCurrentArm = false;
 
         // Scan bars from timeout L bar to current for initial pendingIntermedHigh
-        pendingIntermedHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
-        pendingIntermedHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
-        for(int i = 1; i <= barIndex; i++)
+        // Use array buffers instead of repeated iHigh/iTime calls - O(1) array access vs O(n) function calls
+        int scanBars = barIndex + 2;  // +2 for safety margin
+        double hiBuffer[];
+        datetime tmBuffer[];
+        ArraySetAsSeries(hiBuffer, true);
+        ArraySetAsSeries(tmBuffer, true);
+
+        if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, scanBars, hiBuffer) >= scanBars &&
+           CopyTime(_Symbol, PERIOD_CURRENT, 0, scanBars, tmBuffer) >= scanBars)
         {
-            double hi = iHigh(_Symbol, PERIOD_CURRENT, i);
-            if(hi > pendingIntermedHigh)
+            pendingIntermedHigh = hiBuffer[1];
+            pendingIntermedHighTime = tmBuffer[1];
+            for(int i = 1; i <= barIndex && i < ArraySize(hiBuffer); i++)
             {
-                pendingIntermedHigh = hi;
-                pendingIntermedHighTime = iTime(_Symbol, PERIOD_CURRENT, i);
+                if(hiBuffer[i] > pendingIntermedHigh)
+                {
+                    pendingIntermedHigh = hiBuffer[i];
+                    pendingIntermedHighTime = tmBuffer[i];
+                }
             }
         }
+        else
+        {
+            // Fallback to function calls if array copy fails
+            pendingIntermedHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+            pendingIntermedHighTime = iTime(_Symbol, PERIOD_CURRENT, 1);
+        }
+
         // Initialize the high tracker
         highSinceLastValidLow = pendingIntermedHigh;
         highSinceLastValidLowTime = pendingIntermedHighTime;
@@ -2010,12 +2055,8 @@ bool IsHourInSession(int hour, int startHour, int endHour)
 
 bool IsHourBlocked(int hour)
 {
-    if(InpBlockHour1 >= 0 && hour == InpBlockHour1) return true;
-    if(InpBlockHour2 >= 0 && hour == InpBlockHour2) return true;
-    if(InpBlockHour3 >= 0 && hour == InpBlockHour3) return true;
-    if(InpBlockHour4 >= 0 && hour == InpBlockHour4) return true;
-    if(InpBlockHour5 >= 0 && hour == InpBlockHour5) return true;
-    return false;
+    // O(1) array lookup instead of O(5) conditional checks
+    return (hour >= 0 && hour < 24) ? blockedHours[hour] : false;
 }
 
 //+------------------------------------------------------------------+
